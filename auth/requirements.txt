@@ -1,0 +1,7 @@
+fastapi[standard]>=0.110.0
+pydantic>=2.6.0
+sqlalchemy>=2.0.28
+asyncpg>=0.29.0
+passlib[bcrypt]>=1.7.4
+pyjwt>=2.8.0
+python-dotenv>=1.0.1

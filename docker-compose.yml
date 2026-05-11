@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: orchestrator-db-local
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+      POSTGRES_DB: orchestrator_db
+    volumes:
+      - ./db/init_schema.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+
+  auth:
+    build: ./auth
+    container_name: orchestrator-auth
+    ports:
+      - "8081:8081"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+      - SECRET_KEY=supersecretkey_change_in_production
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  image-manager:
+    build: ./image-manager
+    container_name: orchestrator-image-manager
+    ports:
+      - "8083:8083"
+    environment:
+      - IMAGE_BASE_PATH=/mnt/storage/base/
+      - INSTANCE_BASE_PATH=/mnt/storage/instances/
+    volumes:
+      - ./storage_mock/base:/mnt/storage/base/
+      - ./storage_mock/instances:/mnt/storage/instances/
+    restart: unless-stopped
+
+  monitoring:
+    build: ./monitoring
+    container_name: orchestrator-monitoring
+    ports:
+      - "8084:8084"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+      - SECRET_KEY=supersecretkey_change_in_production
+      - SSH_ENABLED=false
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  networking:
+    build: ./networking
+    container_name: orchestrator-networking
+    ports:
+      - "8085:8085"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  slice-manager:
+    build: ./slice-manager
+    container_name: orchestrator-slice-manager
+    ports:
+      - "8082:8082"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+      - SECRET_KEY=supersecretkey_change_in_production
+      - IMAGE_MANAGER_URL=http://image-manager:8083
+      - NETWORKING_URL=http://networking:8085
+    depends_on:
+      - postgres
+      - image-manager
+      - networking
+    restart: unless-stopped
