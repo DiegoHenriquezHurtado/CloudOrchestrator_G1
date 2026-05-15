@@ -63,8 +63,7 @@ async def allocate_network(request: AllocateRequest, db: AsyncSession = Depends(
     network_responses = []
 
     for i, net_req in enumerate(request.networks):
-        vlan_inner = (i + 1) * 100  # 100, 200, 300, ... local al Br-Slice
-
+        
         # Determinar workers de las VMs en este enlace
         workers_on_link: Set[int] = set()
         for vm in request.vms:
@@ -72,8 +71,13 @@ async def allocate_network(request: AllocateRequest, db: AsyncSession = Depends(
                 if iface.network_name == net_req.name:
                     workers_on_link.add(vm_worker[vm.vm_id])
 
-        is_remote = len(workers_on_link) > 1
 
+        #vlan_inner = (i + 1) * 100  # 100, 200, 300, ... local al Br-Slice
+        #para vlan_inner 0 para enlace local
+        is_remote = len(workers_on_link) > 1
+        vlan_inner = 0 if not is_remote else (i + 1) * 100
+
+        
         # Subnet para IPAM: 10.{vlan_slice % 256}.{link_index + 1}.0/24
         subnet = f"10.{vlan_slice % 256}.{i + 1}.0/24"
         subnet_base = f"10.{vlan_slice % 256}.{i + 1}"
