@@ -15,17 +15,18 @@ services:
     restart: unless-stopped
 
   auth:
-    build: ./auth
+    build:
+      context: ./auth
+      dockerfile: Dockerfile
     container_name: orchestrator-auth
     ports:
       - "8081:8081"
     environment:
       - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
-      - SECRET_KEY=supersecretkey_change_in_production
     depends_on:
       - postgres
     restart: unless-stopped
-
+      
   image-manager:
     build: ./image-manager
     container_name: orchestrator-image-manager
