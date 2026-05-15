@@ -1,78 +1,87 @@
 from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import Optional
-import models, schemas, utils
-from database import get_db, engine
+import jwt
 
-app = FastAPI(title="Orquestador Cloud - Auth Service")
+from database import get_db
+from models import User
+from schemas import UserCreate, UserResponse, UserLogin, Token, UserVerifyResponse
+from security import get_password_hash, verify_password, create_access_token, SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
+from datetime import timedelta
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+app = FastAPI(title="Orchestrator Auth API")
 
-async def get_current_user_token(token: str = Depends(oauth2_scheme)):
-    if not token:
-        return None
-    payload = utils.decode_access_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return payload
+security = HTTPBearer()
 
-@app.post("/auth/login", response_model=schemas.Token)
-async def login(user_credentials: schemas.UserLogin, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(models.User).where(models.User.username == user_credentials.username))
-    user = result.scalars().first()
-
-    if not user or not utils.verify_password(user_credentials.password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-
-    access_token = utils.create_access_token(
-        data={"sub": str(user.id), "username": user.username, "role": user.role}
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/auth/register", response_model=schemas.UserResponse)
-async def register(user_data: schemas.UserRegister, token: Optional[str] = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
-    admin_id = None
-    role_to_assign = user_data.role or "STUDENT"
-
-    if token:
-        payload = await get_current_user_token(token)
-        if payload:
-            creator_role = payload.get("role")
-            if creator_role == "SLICE_ADMIN":
-                admin_id = int(payload.get("sub"))
-                role_to_assign = "STUDENT"
-            elif creator_role == "STUDENT":
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Students cannot register new users")
-            # If SYSTEM_ADMIN, they can register anyone without admin_id constraints, unless specified
-
-    # Check if user exists
-    result = await db.execute(select(models.User).where(models.User.username == user_data.username))
+@app.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
+    if user.role not in ["STUDENT", "SLICE_ADMIN", "SYSTEM_ADMIN"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    
+    if user.role == "STUDENT" and user.admin_id is None:
+        raise HTTPException(status_code=400, detail="admin_id is mandatory for STUDENT role")
+    
+    result = await db.execute(select(User).where(User.username == user.username))
     if result.scalars().first():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already registered")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already exists")
+    
+    if user.admin_id is not None:
+        admin_result = await db.execute(select(User).where(User.id == user.admin_id))
+        admin = admin_result.scalars().first()
+        if not admin or admin.role != "SLICE_ADMIN":
+            raise HTTPException(status_code=400, detail="admin_id does not correspond to a SLICE_ADMIN")
 
-    new_user = models.User(
-        username=user_data.username,
-        password_hash=utils.get_password_hash(user_data.password),
-        role=role_to_assign,
-        admin_id=admin_id
+    hashed_password = get_password_hash(user.password)
+    new_user = User(
+        username=user.username,
+        password_hash=hashed_password,
+        role=user.role,
+        admin_id=user.admin_id
     )
-
+    
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
+    
     return new_user
 
-@app.get("/auth/verify", response_model=schemas.TokenData)
-async def verify(token: str = Depends(oauth2_scheme)):
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    payload = await get_current_user_token(token)
-    if not payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    return schemas.TokenData(**payload)
+@app.post("/auth/login", response_model=Token)
+async def login(user_data: UserLogin, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.username == user_data.username))
+    user = result.scalars().first()
+    
+    if not user or not verify_password(user_data.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.id, "username": user.username, "role": user.role},
+        expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/auth/verify", response_model=UserVerifyResponse)
+async def verify(credentials: HTTPAuthorizationCredentials = Depends(security), db: AsyncSession = Depends(get_db)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+        
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalars().first()
+    
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        
+    return UserVerifyResponse(
+        id=user.id,
+        username=user.username,
+        role=user.role,
+        admin_id=user.admin_id
+    )

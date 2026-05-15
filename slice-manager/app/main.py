@@ -18,14 +18,14 @@ NETWORKING_URL = os.getenv("NETWORKING_URL", "http://networking:8085")
 @app.post("/slices/", response_model=SliceResponse)
 async def create_slice(topology: TopologyCreate, user: User = Depends(get_current_student), db: AsyncSession = Depends(get_db)):
     # 1. Validate images with Image Manager
-    async with httpx.AsyncClient() as client:
-        for vm in topology.vms:
-            try:
-                resp = await client.get(f"{IMAGE_MANAGER_URL}/images/{vm.base_image}/validate")
-                if resp.status_code != 200:
-                    raise HTTPException(status_code=400, detail=f"Image {vm.base_image} validation failed")
-            except httpx.RequestError:
-                raise HTTPException(status_code=503, detail="Image Manager is unavailable")
+    #async with httpx.AsyncClient() as client:
+    #    for vm in topology.vms:
+    #        try:
+    #            resp = await client.get(f"{IMAGE_MANAGER_URL}/images/{vm.base_image}/validate")
+    #            if resp.status_code != 200:
+    #                raise HTTPException(status_code=400, detail=f"Image {vm.base_image} validation failed")
+    #        except httpx.RequestError:
+    #            raise HTTPException(status_code=503, detail="Image Manager is unavailable")
                 
     # 2. Create preliminary slice
     new_slice = Slice(user_id=user.id, name=topology.name, status='PENDING_APPROVAL')
@@ -61,13 +61,13 @@ async def create_slice(topology: TopologyCreate, user: User = Depends(get_curren
             "interfaces": [{"network_name": iface.network_name, "interface_name": iface.interface_name} for iface in vm_req.interfaces]
         })
         
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post(f"{NETWORKING_URL}/networking/allocate", json=networking_payload)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=400, detail=f"Networking allocation failed: {resp.text}")
-        except httpx.RequestError:
-            raise HTTPException(status_code=503, detail="Networking module is unavailable")
+    #async with httpx.AsyncClient() as client:
+    #    try:
+    #        resp = await client.post(f"{NETWORKING_URL}/networking/allocate", json=networking_payload)
+    #        if resp.status_code != 200:
+    #            raise HTTPException(status_code=400, detail=f"Networking allocation failed: {resp.text}")
+    #    except httpx.RequestError:
+    #        raise HTTPException(status_code=503, detail="Networking module is unavailable")
             
     await db.commit()
     return new_slice
@@ -201,11 +201,11 @@ async def reject_slice(id: int, user: User = Depends(get_current_slice_admin), d
     slice_obj.status = 'FAILED'
     
     # Optional: trigger networking release for the slice since it was rejected
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post(f"{NETWORKING_URL}/networking/release", json={"slice_id": id})
-        except httpx.RequestError:
-            pass
+    #async with httpx.AsyncClient() as client:
+    #    try:
+    #        await client.post(f"{NETWORKING_URL}/networking/release", json={"slice_id": id})
+    #    except httpx.RequestError:
+    #        pass
             
     await db.commit()
     return {"status": "success", "message": "Slice rejected"}
