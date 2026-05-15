@@ -1,45 +1,38 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, func
-from sqlalchemy.orm import relationship
-from database import Base
+import datetime
+from sqlalchemy.orm import declarative_base, Mapped, mapped_column
+from sqlalchemy import Integer, String, DECIMAL, TIMESTAMP, text, ForeignKey
+
+Base = declarative_base()
 
 class Worker(Base):
     __tablename__ = "workers"
-    id = Column(Integer, primary_key=True, index=True)
-    hostname = Column(String(50), nullable=False)
-    ip_management = Column(String(15), nullable=False)
-    total_ram = Column(Integer, nullable=False)
-    total_cpu = Column(Integer, nullable=False)
-    current_cpu_load = Column(Float, default=0.0)
-    current_ram_available = Column(Integer, default=0)
-    status = Column(String(20), default="ALIVE")
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-    
-    vms = relationship("VirtualMachine", back_populates="worker")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hostname: Mapped[str] = mapped_column(String(50), nullable=False)
+    ip_management: Mapped[str] = mapped_column(String(15), nullable=False)
+    total_ram: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_cpu: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_cpu_load: Mapped[float] = mapped_column(DECIMAL(5, 2), default=0.0)
+    current_ram_available: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="ALIVE")
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP")
+    )
 
+# Models for role visibility
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, nullable=False)
-    password_hash = Column(String(255), nullable=False)
-    role = Column(String(20), default="STUDENT")
-    admin_id = Column(Integer, ForeignKey("users.id"))
-    slices = relationship("Slice", back_populates="user")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default="STUDENT")
+    admin_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
 
 class Slice(Base):
     __tablename__ = "slices"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    name = Column(String(100), nullable=False)
-    status = Column(String(20), default="PENDING_APPROVAL")
-    user = relationship("User", back_populates="slices")
-    vms = relationship("VirtualMachine", back_populates="slice")
-
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"))
+    
 class VirtualMachine(Base):
     __tablename__ = "virtual_machines"
-    id = Column(Integer, primary_key=True, index=True)
-    slice_id = Column(Integer, ForeignKey("slices.id"))
-    name = Column(String(100), nullable=False)
-    worker_id = Column(Integer, ForeignKey("workers.id"))
-    status = Column(String(20), default="PENDING_APPROVAL")
-    slice = relationship("Slice", back_populates="vms")
-    worker = relationship("Worker", back_populates="vms")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    slice_id: Mapped[int] = mapped_column(Integer, ForeignKey("slices.id", ondelete="CASCADE"))
+    worker_id: Mapped[int] = mapped_column(Integer, ForeignKey("workers.id"), nullable=True)

@@ -48,6 +48,34 @@ services:
       - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
     depends_on:
       - postgres
+  
+  image-manager:
+    build:
+      context: ./image-manager
+      dockerfile: Dockerfile
+    container_name: orchestrator-image-manager
+    ports:
+      - "8083:8083"
+    environment:
+      - IMAGE_BASE_PATH=/mnt/storage/base/
+      - IMAGE_INSTANCES_PATH=/mnt/storage/instances/
+    volumes:
+      - /mnt/storage:/mnt/storage
+
+  monitoring:
+    build:
+      context: ./monitoring
+      dockerfile: Dockerfile
+    container_name: orchestrator-monitoring
+    ports:
+      - "8084:8084"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+      - SSH_ENABLED=true
+    depends_on:
+      - postgres
+    volumes:
+      - ~/.ssh:/root/.ssh:ro
 
 volumes:
   pgdata:
