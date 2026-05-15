@@ -57,22 +57,26 @@ CREATE TABLE virtual_machines (
 
 CREATE TABLE networks (
     id SERIAL PRIMARY KEY,
-    slice_id INT REFERENCES slices(id) ON DELETE CASCADE,
-    vlan_id INT REFERENCES vlan_pool(vlan_id),
-    subnet_cidr VARCHAR(18), -- ej. '192.168.100.0/24' (IPAM)
-    bridge_name VARCHAR(30), -- ej. 'br-lk-5' (Un bridge OvS único por enlace)
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    slice_id    INT REFERENCES slices(id) ON DELETE CASCADE,
+    vlan_slice  INT REFERENCES vlan_pool(vlan_id), -- VLAN de transporte inter-worker (una por Slice)
+    vlan_inner  INT NOT NULL,                       -- etiqueta local dentro del Br-Slice (100,200,...)
+    subnet_cidr VARCHAR(18),                        -- ej. '10.150.1.0/24' (IPAM)
+    bridge_name VARCHAR(30),                        -- ej. 'br-sl-{slice_id}' (Br-Slice del usuario)
+    is_remote   BOOLEAN DEFAULT FALSE,              -- TRUE si las VMs del enlace están en Workers distintos
+    internet_access BOOLEAN DEFAULT FALSE,          -- habilita NAT salida a Internet
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Tabla asociativa: cada registro es un "cable virtual" que conecta una VM a un bridge de enlace
+-- Tabla asociativa: cada registro es un "cable virtual" (TAP conectado al Br-Slice)
 CREATE TABLE vm_interfaces (
-    id SERIAL PRIMARY KEY,
-    vm_id INT REFERENCES virtual_machines(id) ON DELETE CASCADE,
-    network_id INT REFERENCES networks(id) ON DELETE CASCADE,
-    mac_address VARCHAR(17),
-    ip_address VARCHAR(15), -- IP asignada en esa red (IPAM y Dashboards)
-    interface_name VARCHAR(20), -- ej. 'eth0', 'eth1' dentro del guest (VM)
-    tap_name VARCHAR(30) -- ej. 'tap-vmb-eth0' en el host Worker para OvS
+    id             SERIAL PRIMARY KEY,
+    vm_id          INT REFERENCES virtual_machines(id) ON DELETE CASCADE,
+    network_id     INT REFERENCES networks(id) ON DELETE CASCADE,
+    worker_id      INT REFERENCES workers(id),      -- Worker donde corre esta VM
+    mac_address    VARCHAR(17),
+    ip_address     VARCHAR(15),     -- IP dentro de la subnet del enlace
+    interface_name VARCHAR(20),     -- ej. 'eth0', 'eth1' dentro del guest
+    tap_name       VARCHAR(30)      -- ej. 'tap-1-eth0' en el host Worker para OvS
 );
 
 CREATE TABLE tasks (
@@ -86,6 +90,20 @@ CREATE TABLE tasks (
     error_msg TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Reglas de seguridad entre VMs dentro de un slice (enforcement via OpenFlow en OvS)
+CREATE TABLE security_rules (
+    id SERIAL PRIMARY KEY,
+    slice_id INT REFERENCES slices(id) ON DELETE CASCADE,
+    src_vm_id INT REFERENCES virtual_machines(id) ON DELETE CASCADE,
+    dst_vm_id INT REFERENCES virtual_machines(id) ON DELETE CASCADE,
+    protocol VARCHAR(10) DEFAULT 'any',   -- tcp, udp, icmp, any
+    port_min INT,                         -- NULL = cualquier puerto
+    port_max INT,
+    action VARCHAR(10) DEFAULT 'ALLOW',   -- ALLOW, DENY
+    priority INT DEFAULT 100,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Tabla de configuración clave-valor para estado persistente de los módulos
