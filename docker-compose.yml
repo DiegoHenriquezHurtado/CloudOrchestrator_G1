@@ -78,3 +78,14 @@ services:
       - image-manager
       - networking
     restart: unless-stopped
+
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    depends_on:
+      - auth
+      - slice-manager
+      - monitoring
