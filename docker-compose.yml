@@ -39,5 +39,15 @@ services:
       - JWT_SECRET=supersecretkey_orchestrator
       - AUTH_URL=http://auth:8081/auth
 
+  vm-placement:
+    build: ./vm-placement
+    container_name: vm-placement
+    ports:
+      - "8086:8086"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+    depends_on:
+      - postgres
+
 volumes:
   pgdata:
