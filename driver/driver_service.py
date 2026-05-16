@@ -56,26 +56,26 @@ class DriverService:
 
         # --- 1. Thin Provisioning ---
         base_path = f"/mnt/storage/base/{req.vm.base_image}"
-        commands.append(f"qemu-img create -f qcow2 -b {base_path} {req.vm.instance_path}")
-        rollback_actions.append(f"rm -f {req.vm.instance_path}")
+        commands.append(f"sudo qemu-img create -f qcow2 -b {base_path} {req.vm.instance_path}")
+        rollback_actions.append(f"sudo rm -f {req.vm.instance_path}")
 
         # --- 2. Bridges idempotentes ---
-        commands.append("ovs-vsctl --may-exist add-br br-wk")
-        commands.append("ovs-vsctl --may-exist add-port br-wk ens4")
+        commands.append("sudo ovs-vsctl --may-exist add-br br-wk")
+        commands.append("sudo ovs-vsctl --may-exist add-port br-wk ens4")
 
         bridge_name = f"br-sl-{req.slice.id}"
         if req.interfaces:
             bridge_name = req.interfaces[0].bridge_name
-        commands.append(f"ovs-vsctl --may-exist add-br {bridge_name}")
+        commands.append(f"sudo ovs-vsctl --may-exist add-br {bridge_name}")
 
         # --- 3. TAPs con Vlan-Inner ---
         has_remote = False
         for iface in req.interfaces:
             if iface.vlan_inner and iface.vlan_inner > 0:
-                commands.append(f"ovs-vsctl add-port {bridge_name} {iface.tap_name} tag={iface.vlan_inner}")
+                commands.append(f"sudo ovs-vsctl add-port {bridge_name} {iface.tap_name} tag={iface.vlan_inner}")
             else:
-                commands.append(f"ovs-vsctl add-port {bridge_name} {iface.tap_name}")
-            rollback_actions.append(f"ovs-vsctl --if-exists del-port {bridge_name} {iface.tap_name}")
+                commands.append(f"sudo ovs-vsctl add-port {bridge_name} {iface.tap_name}")
+            rollback_actions.append(f"sudo ovs-vsctl --if-exists del-port {bridge_name} {iface.tap_name}")
             if iface.is_remote:
                 has_remote = True
 
@@ -84,11 +84,11 @@ class DriverService:
             patch_wk = f"patch-to-wk-{req.slice.id}"
             patch_sl = f"patch-to-sl-{req.slice.id}"
             commands.append(
-                f"ovs-vsctl --may-exist add-port {bridge_name} {patch_wk} "
+                f"sudo ovs-vsctl --may-exist add-port {bridge_name} {patch_wk} "
                 f"-- set interface {patch_wk} type=patch options:peer={patch_sl}"
             )
             commands.append(
-                f"ovs-vsctl --may-exist add-port br-wk {patch_sl} tag={req.slice.vlan_slice} "
+                f"sudo ovs-vsctl --may-exist add-port br-wk {patch_sl} tag={req.slice.vlan_slice} "
                 f"-- set interface {patch_sl} type=patch options:peer={patch_wk}"
             )
 
@@ -97,7 +97,8 @@ class DriverService:
         vnc_port = 5900 + vnc_display
 
         qemu_parts = [
-            "qemu-system-x86_64",
+            "SEED_OPT=\"\"; if [ -f /mnt/storage/base/seed.iso ]; then SEED_OPT=\"-drive file=/mnt/storage/base/seed.iso,media=cdrom,readonly=on\"; fi; "
+            "sudo qemu-system-x86_64 $SEED_OPT",
             f"-m {req.vm.ram}",
             f"-smp {req.vm.vcpu}",
             f"-drive file={req.vm.instance_path},format=qcow2",
@@ -117,7 +118,7 @@ class DriverService:
         commands.append(qemu_cmd)
 
         # --- 6. Leer PID ---
-        commands.append(f"cat /tmp/{req.vm.name}.pid")
+        commands.append(f"sudo cat /tmp/{req.vm.name}.pid")
 
         # --- Ejecutar ---
         results = await execute_on_worker(req.worker_ip, commands)
@@ -154,13 +155,13 @@ class DriverService:
 
         # 1. Kill QEMU
         if req.process_id:
-            commands.append(f"kill {req.process_id} 2>/dev/null || true")
+            commands.append(f"sudo kill {req.process_id} 2>/dev/null || true")
 
         # 2. Remove instance disk
-        commands.append(f"rm -f {req.vm.instance_path}")
+        commands.append(f"sudo rm -f {req.vm.instance_path}")
 
         # 3. Remove pidfile
-        commands.append(f"rm -f /tmp/{req.vm.name}.pid")
+        commands.append(f"sudo rm -f /tmp/{req.vm.name}.pid")
 
         # 4. Delete TAPs
         bridge_name = f"br-sl-{req.slice.id}"
@@ -168,20 +169,20 @@ class DriverService:
             bridge_name = req.interfaces[0].bridge_name
 
         for iface in req.interfaces:
-            commands.append(f"ovs-vsctl --if-exists del-port {bridge_name} {iface.tap_name}")
+            commands.append(f"sudo ovs-vsctl --if-exists del-port {bridge_name} {iface.tap_name}")
 
         # 5. Delete patch-ports if remote
         has_remote = any(iface.is_remote for iface in req.interfaces)
         if has_remote:
             patch_wk = f"patch-to-wk-{req.slice.id}"
             patch_sl = f"patch-to-sl-{req.slice.id}"
-            commands.append(f"ovs-vsctl --if-exists del-port {bridge_name} {patch_wk}")
-            commands.append(f"ovs-vsctl --if-exists del-port br-wk {patch_sl}")
+            commands.append(f"sudo ovs-vsctl --if-exists del-port {bridge_name} {patch_wk}")
+            commands.append(f"sudo ovs-vsctl --if-exists del-port br-wk {patch_sl}")
 
         # 6. Delete bridge if empty (check if only has patch ports or none)
         commands.append(
-            f"port_count=$(ovs-vsctl list-ports {bridge_name} 2>/dev/null | wc -l); "
-            f"if [ \"$port_count\" -eq 0 ]; then ovs-vsctl --if-exists del-br {bridge_name}; fi"
+            f"port_count=$(sudo ovs-vsctl list-ports {bridge_name} 2>/dev/null | wc -l); "
+            f"if [ \"$port_count\" -eq 0 ]; then sudo ovs-vsctl --if-exists del-br {bridge_name}; fi"
         )
 
         results = await execute_on_worker(req.worker_ip, commands)
@@ -212,14 +213,14 @@ class DriverService:
             bridge = flow_entry.get("bridge", bridge_name)
             flow = flow_entry.get("flow", "")
             if flow:
-                commands.append(f'ovs-ofctl add-flow {bridge} "{flow}"')
+                commands.append(f'sudo ovs-ofctl add-flow {bridge} "{flow}"')
 
         # 2. Policy flows (user rules from security_rules)
         for flow_entry in (req.policy_flows or []):
             bridge = flow_entry.get("bridge", bridge_name)
             flow = flow_entry.get("flow", "")
             if flow:
-                commands.append(f'ovs-ofctl add-flow {bridge} "{flow}"')
+                commands.append(f'sudo ovs-ofctl add-flow {bridge} "{flow}"')
 
         # 3. NAT commands for networks with internet_access
         nat_commands = await self._fetch_nat_commands(req.slice.id)

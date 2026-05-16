@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy import text
 from typing import List
 
 from database import get_db
@@ -14,6 +15,7 @@ router = APIRouter()
 IMAGE_MANAGER_URL = os.getenv("IMAGE_MANAGER_URL", "http://image-manager:8083")
 NETWORKING_URL = os.getenv("NETWORKING_URL", "http://networking:8085")
 PLACEMENT_URL = os.getenv("PLACEMENT_URL", "http://vm-placement:8086")
+DRIVER_URL = os.getenv("DRIVER_URL", "http://driver:8088")
 
 async def get_current_user(x_user_role: str = Header(...), x_user_id: int = Header(...), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(models.User).where(models.User.id == x_user_id))
@@ -459,7 +461,65 @@ async def delete_slice(
     networks_count = len(slice_obj.networks)
     vlan_freed = slice_obj.vlan_slice
 
-    # Liberar recursos de Networking si existen
+    # 1. Limpiar VMs en los workers sincrónicamente antes de borrar de la BD (para que pueda leer las interfaces)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for vm in slice_obj.vms:
+            if not vm.worker_id:
+                continue
+
+            worker_res = await db.execute(text(f"SELECT ip_management FROM workers WHERE id = {vm.worker_id}"))
+            worker_ip = worker_res.scalar()
+            if not worker_ip:
+                continue
+
+            ifaces_res = await db.execute(
+                select(models.VmInterface).where(models.VmInterface.vm_id == vm.id)
+            )
+            ifaces = ifaces_res.scalars().all()
+            
+            interfaces_payload = []
+            for iface in ifaces:
+                net_res = await db.execute(
+                    select(models.Network).where(models.Network.id == iface.network_id)
+                )
+                net = net_res.scalar_one_or_none()
+                interfaces_payload.append({
+                    "interface_name": iface.interface_name,
+                    "tap_name": iface.tap_name,
+                    "vlan_inner": net.vlan_inner if net else 0,
+                    "ip_address": iface.ip_address,
+                    "mac_address": iface.mac_address,
+                    "bridge_name": f"br-sl-{id}",
+                    "is_remote": net.is_remote if net else False,
+                    "internet_access": net.internet_access if net else False
+                })
+
+            driver_request = {
+                "task_id": 0,
+                "task_type": "DELETE_VM",
+                "worker_ip": worker_ip,
+                "process_id": vm.process_id,
+                "vm": {
+                    "id": vm.id,
+                    "name": vm.name,
+                    "base_image": vm.base_image,
+                    "ram": vm.ram,
+                    "vcpu": vm.vcpu,
+                    "instance_path": vm.instance_path or f"/mnt/storage/instances/{vm.id}.qcow2",
+                },
+                "slice": {
+                    "id": slice_obj.id,
+                    "vlan_slice": slice_obj.vlan_slice or 0,
+                },
+                "interfaces": interfaces_payload
+            }
+
+            try:
+                await client.post(f"{DRIVER_URL}/driver/execute", json=driver_request)
+            except httpx.RequestError:
+                pass  # Best-effort deletion
+
+    # 2. Liberar recursos de Networking si existen en la BD
     if vlan_freed:
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:

@@ -1,5 +1,5 @@
 fastapi
 uvicorn[standard]
 httpx
-PyJWT
+PyJWT==2.8.0
 python-dotenv
