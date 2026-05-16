@@ -141,5 +141,15 @@ services:
       - ~/.ssh:/root/.ssh:ro
       - /mnt/storage:/mnt/storage
 
+  frontend:
+    image: nginx:alpine
+    container_name: orchestrator-frontend
+    ports:
+      - "3000:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on:
+      - api-gateway
+
 volumes:
   pgdata:

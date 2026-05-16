@@ -1,5 +1,5 @@
 // Cambia esta URL si el gateway corre en otro host/puerto
-const API = 'http://localhost:9090/api/v1';
+const API = 'http://localhost:8080/api/v1';
 
 // ── Estado global ─────────────────────────────────────────────
 const state = {
@@ -52,8 +52,12 @@ function badge(status) {
     READY:            'badge-active',
     PENDING_APPROVAL: 'badge-pending',
     PENDING:          'badge-pending',
+    PLACEMENT_READY:  'badge-pending',
+    IN_PROGRESS:      'badge-pending',
     FAILED:           'badge-failed',
     TERMINATING:      'badge-failed',
+    REJECTED:         'badge-failed',
+    DELETED:          'badge-failed',
   };
   const cls = map[status] || 'badge-info';
   return `<span class="badge ${cls}">${status}</span>`;
@@ -176,7 +180,7 @@ async function renderOverview() {
   content.innerHTML = `<div class="grid-stats" id="stats-grid"><div class="text-muted">Cargando...</div></div>`;
 
   try {
-    const slices = await api('GET', '/slices/');
+    const { slices } = await api('GET', '/slices/');
 
     const total    = slices.length;
     const active   = slices.filter(s => s.status === 'ACTIVE').length;
@@ -219,7 +223,7 @@ async function renderMySlices() {
   const content = document.getElementById('content');
   content.innerHTML = `<div class="text-muted">Cargando...</div>`;
   try {
-    const slices = await api('GET', '/slices/');
+    const { slices } = await api('GET', '/slices/');
     if (slices.length === 0) {
       content.innerHTML = `<div class="card"><div class="empty-state"><div class="empty-icon">🗂️</div><p>No tienes slices. <a href="#" onclick="navigate('new-slice')">Solicita uno.</a></p></div></div>`;
       return;
@@ -639,17 +643,19 @@ async function tdSubmit() {
   if (!TD.vms.length)   { toast('Agrega al menos una VM','error'); return; }
   if (!TD.links.length) { toast('Dibuja al menos un enlace entre VMs','error'); return; }
 
-  const networks = TD.links.map(l=>l.name);
-  const vms = TD.vms.map(vm => {
-    const myLinks = TD.links.filter(l=>l.vmA===vm.id||l.vmB===vm.id);
-    return {
-      name: vm.name, base_image: vm.base_image, ram: vm.ram, vcpu: vm.vcpu,
-      interfaces: myLinks.map((l,i)=>({ network_name:l.name, interface_name:`eth${i}` })),
-    };
+  const vms = TD.vms.map(vm => ({
+    name: vm.name, base_image: vm.base_image, ram: vm.ram, vcpu: vm.vcpu,
+  }));
+
+  // Cada link del diseñador se convierte en un enlace vm_a/vm_b con nombres de VM
+  const links = TD.links.map(l => {
+    const vmA = TD.vms.find(v => v.id === l.vmA);
+    const vmB = TD.vms.find(v => v.id === l.vmB);
+    return { vm_a: vmA?.name || '', iface_a: 'eth0', vm_b: vmB?.name || '', iface_b: 'eth0' };
   });
 
   try {
-    await api('POST', '/slices/', { name, networks, vms });
+    await api('POST', '/slices/', { name, vms, links });
     toast('Slice enviado para aprobación','success');
     if (TD.animFrame) cancelAnimationFrame(TD.animFrame);
     navigate('my-slices');
@@ -667,19 +673,19 @@ async function viewSliceDetail(id) {
           ${badge(vm.status)}
         </div>
         <div style="font-size:12px;color:var(--text-muted);display:flex;gap:16px;margin-bottom:8px">
-          <span>Imagen: <code>${vm.base_image}</code></span>
-          ${vm.worker_id ? `<span>Worker: ${vm.worker_id}</span>` : ''}
-          ${vm.vnc_port  ? `<span>VNC: ${vm.vnc_port}</span>`    : ''}
-          ${vm.process_id ? `<span>PID: ${vm.process_id}</span>` : ''}
+          ${vm.worker_id  ? `<span>Worker: ${vm.worker_id}</span>`   : ''}
+          ${vm.vnc_port   ? `<span>VNC: ${vm.vnc_port}</span>`       : ''}
+          ${vm.process_id ? `<span>PID: ${vm.process_id}</span>`     : ''}
         </div>
         ${vm.interfaces.length ? `
           <div class="table-wrap"><table>
-            <thead><tr><th>Interfaz</th><th>IP</th><th>MAC</th></tr></thead>
+            <thead><tr><th>Interfaz</th><th>IP</th><th>TAP</th><th>VLAN inner</th></tr></thead>
             <tbody>${vm.interfaces.map(i => `
               <tr>
                 <td class="mono">${i.interface_name || '—'}</td>
-                <td class="mono">${i.ip_address || '—'}</td>
-                <td class="mono text-muted">${i.mac_address || '—'}</td>
+                <td class="mono">${i.ip_address     || '—'}</td>
+                <td class="mono text-muted">${i.tap_name  || '—'}</td>
+                <td class="mono text-muted">${i.vlan_inner != null ? i.vlan_inner : '—'}</td>
               </tr>`).join('')}
             </tbody>
           </table></div>` : '<p class="text-muted text-sm">Sin interfaces asignadas aún.</p>'}
@@ -689,7 +695,7 @@ async function viewSliceDetail(id) {
       <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap">
         ${badge(s.status)}
         <span class="text-muted text-sm">ID: ${s.id}</span>
-        <span class="text-muted text-sm">Usuario: ${s.user_id}</span>
+        ${s.vlan_slice ? `<span class="text-muted text-sm">VLAN-Slice: ${s.vlan_slice}</span>` : ''}
       </div>
       <div class="card-title" style="margin-bottom:12px">Máquinas Virtuales</div>
       ${vmsHTML}
@@ -716,7 +722,7 @@ async function renderPending() {
   const content = document.getElementById('content');
   content.innerHTML = `<div class="text-muted">Cargando...</div>`;
   try {
-    const slices = await api('GET', '/slices/');
+    const { slices } = await api('GET', '/slices/');
     const pending = slices.filter(s => s.status === 'PENDING_APPROVAL');
 
     if (pending.length === 0) {
@@ -769,7 +775,7 @@ async function renderAllSlices() {
   const content = document.getElementById('content');
   content.innerHTML = `<div class="text-muted">Cargando...</div>`;
   try {
-    const slices = await api('GET', '/slices/');
+    const { slices } = await api('GET', '/slices/');
 
     const actions = state.user.role === 'SLICE_ADMIN'
       ? s => `
@@ -788,13 +794,13 @@ async function renderAllSlices() {
       : `<div class="card">
           <div class="card-title">Todos los Slices</div>
           <div class="table-wrap"><table>
-            <thead><tr><th>ID</th><th>Nombre</th><th>Estado</th><th>Usuario</th><th>Acciones</th></tr></thead>
+            <thead><tr><th>ID</th><th>Nombre</th><th>Estado</th><th>VMs</th><th>Acciones</th></tr></thead>
             <tbody>${slices.map(s => `
               <tr>
                 <td class="text-muted">#${s.id}</td>
                 <td><strong>${s.name}</strong></td>
                 <td>${badge(s.status)}</td>
-                <td class="text-muted">${s.user_id}</td>
+                <td class="text-muted">${s.vms_count}</td>
                 <td style="display:flex;gap:6px;flex-wrap:wrap">${actions(s)}</td>
               </tr>`).join('')}
             </tbody>
@@ -811,12 +817,13 @@ async function renderNetworking() {
   content.innerHTML = `<div class="text-muted">Cargando...</div>`;
 
   try {
-    const [slices, vlans] = await Promise.all([
+    const [slicesData, vlans] = await Promise.all([
       api('GET', '/slices/'),
       api('GET', '/networking/vlans/available'),
     ]);
+    const slices = slicesData.slices;
 
-    const withNet = slices.filter(s => ['ACTIVE','PENDING','PENDING_APPROVAL'].includes(s.status));
+    const withNet = slices.filter(s => s.status === 'ACTIVE');
 
     content.innerHTML = `
       <div class="grid-stats" style="margin-bottom:20px">
@@ -825,7 +832,7 @@ async function renderNetworking() {
           <div class="stat-label">VLANs disponibles (pool 100–1000)</div>
         </div>
         <div class="stat-card">
-          <div class="stat-value">${901 - vlans.available}</div>
+          <div class="stat-value">${vlans.used}</div>
           <div class="stat-label">VLANs en uso</div>
         </div>
       </div>
