@@ -1,7 +1,24 @@
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, Integer, String, ForeignKey, DECIMAL
+from sqlalchemy import Column, Integer, String, ForeignKey, DECIMAL, TIMESTAMP
+from sqlalchemy.sql import func
 
 Base = declarative_base()
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    quota_ram = Column(Integer)
+    quota_cpu = Column(Integer)
+
+
+class Slice(Base):
+    __tablename__ = "slices"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    status = Column(String)
 
 
 class Worker(Base):
@@ -20,15 +37,18 @@ class Task(Base):
 
     id = Column(Integer, primary_key=True)
     vm_id = Column(Integer, ForeignKey("virtual_machines.id"))
-    slice_id = Column(Integer)
+    slice_id = Column(Integer, ForeignKey("slices.id"))
     status = Column(String)
     task_type = Column(String)
+    worker_id = Column(Integer, ForeignKey("workers.id"))
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
 
 class VirtualMachine(Base):
     __tablename__ = "virtual_machines"
 
     id = Column(Integer, primary_key=True)
+    slice_id = Column(Integer, ForeignKey("slices.id"))
     worker_id = Column(Integer)
     ram = Column(Integer)
     vcpu = Column(Integer)

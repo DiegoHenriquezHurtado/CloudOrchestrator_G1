@@ -48,7 +48,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
     depends_on:
       - postgres
-  
+
   image-manager:
     build:
       context: ./image-manager
@@ -76,6 +76,70 @@ services:
       - postgres
     volumes:
       - ~/.ssh:/root/.ssh:ro
+
+  networking:
+    build:
+      context: ./networking
+      dockerfile: Dockerfile
+    container_name: orchestrator-networking
+    ports:
+      - "8085:8085"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+    depends_on:
+      - postgres
+
+  slice-manager:
+    build:
+      context: ./slice-manager
+      dockerfile: Dockerfile
+    container_name: orchestrator-slice-manager
+    ports:
+      - "8082:8082"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+      - IMAGE_MANAGER_URL=http://image-manager:8083
+      - NETWORKING_URL=http://networking:8085
+      - PLACEMENT_URL=http://vm-placement:8086
+    depends_on:
+      - postgres
+      - image-manager
+      - networking
+      - vm-placement
+
+  dispatcher:
+    build:
+      context: ./dispatcher
+      dockerfile: Dockerfile
+    container_name: orchestrator-dispatcher
+    ports:
+      - "8087:8087"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://orchestrator:orchestrator@postgres:5432/orchestrator_db
+      - DRIVER_URL=http://driver:8088
+      - NETWORKING_URL=http://networking:8085
+      - POLL_INTERVAL_SECONDS=5
+      - STALE_TIMEOUT_MINUTES=10
+    depends_on:
+      - postgres
+      - driver
+      - networking
+
+  driver:
+    build:
+      context: ./driver
+      dockerfile: Dockerfile
+    container_name: orchestrator-driver
+    ports:
+      - "8088:8088"
+    environment:
+      - NETWORKING_URL=http://networking:8085
+      - SSH_ENABLED=true
+    depends_on:
+      - networking
+    volumes:
+      - ~/.ssh:/root/.ssh:ro
+      - /mnt/storage:/mnt/storage
 
 volumes:
   pgdata:
