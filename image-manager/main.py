@@ -1,6 +1,7 @@
 import os
+import asyncio
 import posixpath
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 from pydantic import BaseModel
 
 app = FastAPI(
@@ -45,6 +46,78 @@ def validate_image(name: str):
             "path": posix_filepath
         }
     raise HTTPException(status_code=404, detail="Imagen base no encontrada")
+
+@app.post("/images/upload")
+async def upload_image(
+    file: UploadFile = File(...),
+    x_user_role: str = Header(...)
+):
+    if x_user_role != "SYSTEM_ADMIN":
+        raise HTTPException(status_code=403, detail="Solo SYSTEM_ADMIN puede subir imágenes")
+
+    filename = file.filename
+    if not (filename.endswith(".qcow2") or filename.endswith(".img")):
+        raise HTTPException(status_code=400, detail="Solo se permiten archivos .qcow2 o .img")
+
+    needs_conversion = filename.endswith(".img")
+    final_name = filename.removesuffix(".img") + ".qcow2" if needs_conversion else filename
+
+    os.makedirs(IMAGE_BASE_PATH, exist_ok=True)
+    final_dest = os.path.join(IMAGE_BASE_PATH, final_name)
+
+    if os.path.exists(final_dest):
+        raise HTTPException(status_code=409, detail=f"La imagen {final_name} ya existe")
+
+    # Ruta temporal para el .img antes de convertir
+    upload_dest = os.path.join(IMAGE_BASE_PATH, filename) if needs_conversion else final_dest
+
+    try:
+        with open(upload_dest, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                f.write(chunk)
+
+        if needs_conversion:
+            proc = await asyncio.create_subprocess_exec(
+                "qemu-img", "convert", "-O", "qcow2", upload_dest, final_dest,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            os.remove(upload_dest)
+            if proc.returncode != 0:
+                raise HTTPException(status_code=500, detail=f"Conversión fallida: {stderr.decode().strip()}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        for path in (upload_dest, final_dest):
+            if os.path.exists(path):
+                os.remove(path)
+        raise HTTPException(status_code=500, detail=f"Error procesando imagen: {str(e)}")
+
+    size_mb = os.path.getsize(final_dest) // (1024 * 1024)
+    return {
+        "name": final_name,
+        "original": filename if needs_conversion else None,
+        "converted": needs_conversion,
+        "path": posixpath.join(IMAGE_BASE_PATH, final_name),
+        "size_mb": size_mb,
+        "status": "uploaded"
+    }
+
+
+@app.delete("/images/{name}")
+def delete_image(name: str, x_user_role: str = Header(...)):
+    if x_user_role != "SYSTEM_ADMIN":
+        raise HTTPException(status_code=403, detail="Solo SYSTEM_ADMIN puede eliminar imágenes")
+    if not name.endswith(".qcow2"):
+        raise HTTPException(status_code=400, detail="Solo se pueden eliminar archivos .qcow2")
+    local_filepath = os.path.join(IMAGE_BASE_PATH, name)
+    if not os.path.exists(local_filepath) or not os.path.isfile(local_filepath):
+        raise HTTPException(status_code=404, detail="Imagen no encontrada")
+    os.remove(local_filepath)
+    return {"name": name, "status": "deleted"}
+
 
 @app.post("/images/provision")
 def provision_image(request: ProvisionRequest):

@@ -92,6 +92,7 @@ function navItems(role) {
     pending:   `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
     network:   `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><line x1="12" y1="8" x2="5.5" y2="16.5"/><line x1="12" y1="8" x2="18.5" y2="16.5"/></svg>`,
     infra:     `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="4" rx="1"/><rect x="2" y="10" width="20" height="4" rx="1"/><rect x="2" y="17" width="20" height="4" rx="1"/></svg>`,
+    images:    `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="14" rx="2"/><path d="M16 6V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>`,
   };
 
   const all = {
@@ -108,6 +109,7 @@ function navItems(role) {
     SYSTEM_ADMIN: [
       { id: 'overview',    label: 'Dashboard',         icon: icon.dashboard },
       { id: 'all-slices',  label: 'Todos los Slices',  icon: icon.slices    },
+      { id: 'images',      label: 'Imágenes',           icon: icon.images    },
       { id: 'networking',  label: 'Red & Seguridad',   icon: icon.network   },
     ],
   };
@@ -127,6 +129,7 @@ function navigate(viewId) {
     'new-slice':  'Solicitar Slice',
     'pending':    'Solicitudes Pendientes',
     'all-slices': 'Todos los Slices',
+    'images':     'Gestión de Imágenes',
     'networking': 'Red & Seguridad',
   };
   document.getElementById('topbar-title').textContent = titles[viewId] || viewId;
@@ -137,6 +140,7 @@ function navigate(viewId) {
     'new-slice':  renderNewSlice,
     'pending':    renderPending,
     'all-slices': renderAllSlices,
+    'images':     renderImages,
     'networking': renderNetworking,
   };
 
@@ -811,6 +815,148 @@ async function renderAllSlices() {
   }
 }
 
+// ── SYSTEM_ADMIN: imágenes ────────────────────────────────────
+async function renderImages() {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="text-muted">Cargando...</div>`;
+  try {
+    const data = await api('GET', '/images/');
+    const images = data.images || [];
+
+    content.innerHTML = `
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">Subir imagen base</div>
+        <p class="text-muted text-sm" style="margin:-4px 0 10px">
+          Acepta <strong>.qcow2</strong> y <strong>.img</strong>. Los archivos <code>.img</code> se convierten automáticamente a qcow2 en el servidor.
+        </p>
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <div class="field" style="margin:0;flex:1;min-width:220px">
+            <label>Archivo (.qcow2 o .img)</label>
+            <input type="file" id="img-file-input" accept=".qcow2,.img"
+              style="padding:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);width:100%;box-sizing:border-box" />
+          </div>
+          <button class="btn btn-primary" onclick="uploadImage()" id="btn-upload">
+            Subir imagen
+          </button>
+        </div>
+        <div id="upload-progress" style="display:none;margin-top:10px">
+          <div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden">
+            <div id="progress-bar" style="height:100%;width:0%;background:var(--primary);transition:width 0.2s"></div>
+          </div>
+          <div id="progress-label" class="text-muted text-sm" style="margin-top:4px">Subiendo...</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          Imágenes disponibles
+          <span class="text-muted text-sm" style="font-weight:400;margin-left:8px">${images.length} imagen${images.length !== 1 ? 'es' : ''}</span>
+        </div>
+        ${images.length === 0
+          ? `<div class="empty-state">
+               <div class="empty-icon">💿</div>
+               <p>No hay imágenes base. Sube un archivo .qcow2 para comenzar.</p>
+             </div>`
+          : `<div class="table-wrap"><table>
+               <thead>
+                 <tr><th>Nombre</th><th>Tamaño</th><th>Ruta en workers</th><th>Acciones</th></tr>
+               </thead>
+               <tbody id="images-tbody">
+                 ${images.map(img => `
+                   <tr id="img-row-${CSS.escape(img.name)}">
+                     <td><strong class="mono">${img.name}</strong></td>
+                     <td class="text-muted">${img.size_mb} MB</td>
+                     <td class="mono text-muted text-sm">${img.path}</td>
+                     <td>
+                       <button class="btn btn-danger btn-sm" onclick="deleteImage('${img.name}')">Eliminar</button>
+                     </td>
+                   </tr>`).join('')}
+               </tbody>
+             </table></div>`}
+      </div>`;
+  } catch (e) {
+    content.innerHTML = `<div class="card"><p class="error-msg">${e.message}</p></div>`;
+  }
+}
+
+async function uploadImage() {
+  const input = document.getElementById('img-file-input');
+  if (!input.files.length) { toast('Selecciona un archivo .qcow2', 'error'); return; }
+
+  const file = input.files[0];
+  if (!file.name.endsWith('.qcow2') && !file.name.endsWith('.img')) {
+    toast('Solo se permiten archivos .qcow2 o .img', 'error'); return;
+  }
+
+  const btn = document.getElementById('btn-upload');
+  const progressWrap = document.getElementById('upload-progress');
+  const bar = document.getElementById('progress-bar');
+  const label = document.getElementById('progress-label');
+
+  btn.disabled = true;
+  progressWrap.style.display = 'block';
+  bar.style.width = '0%';
+  const isImg = file.name.endsWith('.img');
+  label.textContent = `Subiendo ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)${isImg ? ' — se convertirá a .qcow2' : ''}...`;
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API}/images/upload`);
+      xhr.setRequestHeader('Authorization', `Bearer ${state.token}`);
+
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          bar.style.width = `${pct}%`;
+          label.textContent = `Subiendo... ${pct}%`;
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(JSON.parse(xhr.responseText));
+        } else {
+          const err = JSON.parse(xhr.responseText || '{}');
+          reject(new Error(err.detail || `Error ${xhr.status}`));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Error de red al subir la imagen'));
+      xhr.send(formData);
+    });
+
+    const finalName = file.name.endsWith('.img')
+      ? file.name.replace(/\.img$/, '.qcow2')
+      : file.name;
+    const msg = file.name.endsWith('.img')
+      ? `"${file.name}" convertida y guardada como "${finalName}"`
+      : `Imagen "${finalName}" subida correctamente`;
+    toast(msg, 'success');
+    input.value = '';
+    renderImages();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    progressWrap.style.display = 'none';
+    bar.style.width = '0%';
+  }
+}
+
+async function deleteImage(name) {
+  if (!confirm(`¿Eliminar la imagen "${name}"? Esta acción no se puede deshacer.`)) return;
+  try {
+    await api('DELETE', `/images/${encodeURIComponent(name)}`);
+    toast(`Imagen "${name}" eliminada`, 'info');
+    renderImages();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
 // ── SYSTEM_ADMIN: networking ──────────────────────────────────
 async function renderNetworking() {
   const content = document.getElementById('content');
@@ -1040,6 +1186,7 @@ Object.assign(window, {
   approveSlice, rejectSlice,
   viewNetDetail, viewOvsCommands, viewSecurityPanel,
   addRule, deleteRule,
+  renderImages, uploadImage, deleteImage,
   // topology designer
   tdSetMode, tdAddVM, tdDeleteSelected, tdSubmit,
   tdUpdateVm, tdUpdateLink,

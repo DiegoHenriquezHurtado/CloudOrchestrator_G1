@@ -35,7 +35,8 @@ async def gateway(service: str, path: str, request: Request):
 
     body = await request.body()
 
-    if len(body) > MAX_BODY_SIZE:
+    is_image_upload = (service == "images" and path.rstrip("/") == "upload")
+    if not is_image_upload and len(body) > MAX_BODY_SIZE:
         raise HTTPException(
             status_code=413,
             detail="Payload excede 2MB"
