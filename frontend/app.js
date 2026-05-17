@@ -93,6 +93,7 @@ function navItems(role) {
     network:   `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><line x1="12" y1="8" x2="5.5" y2="16.5"/><line x1="12" y1="8" x2="18.5" y2="16.5"/></svg>`,
     infra:     `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="4" rx="1"/><rect x="2" y="10" width="20" height="4" rx="1"/><rect x="2" y="17" width="20" height="4" rx="1"/></svg>`,
     images:    `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="14" rx="2"/><path d="M16 6V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>`,
+    users:     `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="16" y1="11" x2="22" y2="11"/></svg>`,
   };
 
   const all = {
@@ -105,12 +106,15 @@ function navItems(role) {
       { id: 'overview',    label: 'Dashboard',        icon: icon.dashboard },
       { id: 'pending',     label: 'Pendientes',        icon: icon.pending  },
       { id: 'all-slices',  label: 'Todos los Slices',  icon: icon.slices   },
+      { id: 'users',       label: 'Usuarios',          icon: icon.users    },
     ],
     SYSTEM_ADMIN: [
       { id: 'overview',    label: 'Dashboard',         icon: icon.dashboard },
       { id: 'all-slices',  label: 'Todos los Slices',  icon: icon.slices    },
+      { id: 'infra',       label: 'Infraestructura',   icon: icon.infra     },
       { id: 'images',      label: 'Imágenes',           icon: icon.images    },
       { id: 'networking',  label: 'Red & Seguridad',   icon: icon.network   },
+      { id: 'users',       label: 'Usuarios',          icon: icon.users     },
     ],
   };
   return all[role] || [];
@@ -129,8 +133,10 @@ function navigate(viewId) {
     'new-slice':  'Solicitar Slice',
     'pending':    'Solicitudes Pendientes',
     'all-slices': 'Todos los Slices',
+    'infra':      'Infraestructura',
     'images':     'Gestión de Imágenes',
     'networking': 'Red & Seguridad',
+    'users':      'Gestión de Usuarios',
   };
   document.getElementById('topbar-title').textContent = titles[viewId] || viewId;
 
@@ -140,8 +146,10 @@ function navigate(viewId) {
     'new-slice':  renderNewSlice,
     'pending':    renderPending,
     'all-slices': renderAllSlices,
+    'infra':      renderInfra,
     'images':     renderImages,
     'networking': renderNetworking,
+    'users':      renderUsers,
   };
 
   const fn = render[viewId];
@@ -594,13 +602,16 @@ function tdRenderProps() {
       <div class="field"><label>Nombre</label>
         <input type="text" value="${vm.name}" oninput="tdUpdateVm(${vm.id},'name',this.value)" /></div>
       <div class="field"><label>Imagen base</label>
-        <input type="text" value="${vm.base_image}" oninput="tdUpdateVm(${vm.id},'base_image',this.value)" /></div>
+        <select id="td-img-${vm.id}" onchange="tdUpdateVm(${vm.id},'base_image',this.value)">
+          <option value="${vm.base_image}">${vm.base_image}</option>
+        </select></div>
       <div class="field-row">
         <div class="field"><label>RAM (MB)</label>
           <input type="number" value="${vm.ram}" min="512" oninput="tdUpdateVm(${vm.id},'ram',+this.value)" /></div>
         <div class="field"><label>vCPUs</label>
           <input type="number" value="${vm.vcpu}" min="1" oninput="tdUpdateVm(${vm.id},'vcpu',+this.value)" /></div>
       </div>`;
+    tdLoadImages(vm.id, vm.base_image);
   } else if (s?.type==='link') {
     const link = TD.links.find(l=>l.id===s.id);
     if (!link) return;
@@ -1151,6 +1162,148 @@ async function deleteRule(ruleId, sliceId) {
   } catch (e) { toast(e.message, 'error'); }
 }
 
+// ── Image loader for topology designer ─────────────
+async function tdLoadImages(vmId, currentImage) {
+  const sel = document.getElementById(`td-img-${vmId}`);
+  if (!sel) return;
+  try {
+    const data = await api('GET', '/images/');
+    const images = data.images || [];
+    sel.innerHTML = images.map(img =>
+      `<option value="${img.name}" ${img.name === currentImage ? 'selected' : ''}>${img.name}</option>`
+    ).join('');
+    if (!images.find(img => img.name === currentImage)) {
+      sel.insertAdjacentHTML('afterbegin', `<option value="${currentImage}" selected>${currentImage}</option>`);
+    }
+  } catch {
+    sel.innerHTML = `<option value="${currentImage}">${currentImage}</option>`;
+  }
+}
+
+// ── Worker infrastructure dashboard ─────────────────
+async function renderInfra() {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="text-muted">Cargando...</div>`;
+  try {
+    const data = await api('GET', '/infra/workers');
+    const workers = data.workers || [];
+    const alive = workers.filter(w => w.status === 'ALIVE').length;
+    const down  = workers.filter(w => w.status === 'DOWN').length;
+
+    content.innerHTML = `
+      <div class="grid-stats" style="margin-bottom:20px">
+        <div class="stat-card"><div class="stat-value">${workers.length}</div><div class="stat-label">Workers totales</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:var(--success)">${alive}</div><div class="stat-label">ALIVE</div></div>
+        <div class="stat-card"><div class="stat-value" style="color:var(--danger)">${down}</div><div class="stat-label">DOWN</div></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Estado de Workers</div>
+        ${workers.length === 0
+          ? '<div class="empty-state"><div class="empty-icon">🖥️</div><p>No hay workers registrados.</p></div>'
+          : `<div class="table-wrap"><table>
+              <thead><tr><th>Hostname</th><th>IP Mgmt</th><th>RAM total</th><th>RAM disponible</th><th>CPU load</th><th>Estado</th><th>Última actualización</th></tr></thead>
+              <tbody>${workers.map(w => `
+                <tr>
+                  <td><strong>${w.hostname || '—'}</strong></td>
+                  <td class="mono">${w.ip_address || '—'}</td>
+                  <td class="mono">${w.total_ram != null ? w.total_ram + ' MB' : '—'}</td>
+                  <td class="mono">${w.current_ram_available != null ? w.current_ram_available + ' MB' : '—'}</td>
+                  <td class="mono">${w.current_cpu_load != null ? w.current_cpu_load.toFixed(2) + '%' : '—'}</td>
+                  <td>${badge(w.status)}</td>
+                  <td class="text-muted text-sm">${w.last_seen ? new Date(w.last_seen).toLocaleString() : '—'}</td>
+                </tr>`).join('')}
+              </tbody>
+            </table></div>`}
+      </div>`;
+  } catch (e) {
+    content.innerHTML = `<div class="card"><p class="error-msg">${e.message}</p></div>`;
+  }
+}
+
+// ── User management ────────────────────────────────
+async function renderUsers() {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="text-muted">Cargando...</div>`;
+
+  // Fetch usuarios y admins en paralelo
+  const [usersData, adminsData] = await Promise.allSettled([
+    api('GET', '/auth/users'),
+    state.user.role === 'SYSTEM_ADMIN' ? api('GET', '/auth/admins') : Promise.resolve({ admins: [] }),
+  ]);
+
+  const realUsers = usersData.status === 'fulfilled' ? (usersData.value.users || []) : [];
+  const admins = adminsData.status === 'fulfilled' ? (adminsData.value.admins || []) : [];
+
+  const adminOptions = admins.length === 0
+    ? `<option value="">— No hay Slice Admins registrados —</option>`
+    : admins.map(a => `<option value="${a.id}">${a.username}</option>`).join('');
+
+  const showRole = state.user.role === 'SYSTEM_ADMIN';
+  const tableHTML = realUsers.length === 0
+    ? `<div class="card" style="margin-bottom:16px">
+        <div class="card-title">Usuarios</div>
+        <div class="empty-state"><div class="empty-icon">👥</div><p>No hay usuarios registrados aún.</p></div>
+       </div>`
+    : `<div class="card" style="margin-bottom:16px">
+        <div class="card-title">Usuarios <span class="text-muted text-sm" style="font-weight:400;margin-left:8px">${realUsers.length} en total</span></div>
+        <div class="table-wrap"><table>
+          <thead><tr>
+            <th>ID</th><th>Username</th>${showRole ? '<th>Rol</th>' : ''}
+          </tr></thead>
+          <tbody>${realUsers.map(u => `
+            <tr>
+              <td class="text-muted">#${u.id}</td>
+              <td><strong>${u.username}</strong></td>
+              ${showRole ? `<td>${badge(u.role)}</td>` : ''}
+            </tr>`).join('')}
+          </tbody>
+        </table></div>
+      </div>`;
+
+  content.innerHTML = tableHTML + `
+    <div class="card">
+      <div class="card-title">Crear usuario</div>
+      <div class="field"><label>Username</label><input type="text" id="nu-username" /></div>
+      <div class="field"><label>Contraseña</label><input type="password" id="nu-password" /></div>
+      <div class="field"><label>Rol</label>
+        <select id="nu-role" onchange="nuToggleAdmin(this.value)">
+          <option value="STUDENT">STUDENT</option>
+          ${state.user.role === 'SYSTEM_ADMIN' ? '<option value="SLICE_ADMIN">SLICE_ADMIN</option>' : ''}
+        </select>
+      </div>
+      ${state.user.role === 'SLICE_ADMIN'
+        ? `<input type="hidden" id="nu-admin-id" value="${state.user.id}" />`
+        : `<div class="field" id="nu-admin-field">
+            <label>Slice Admin asignado</label>
+            <select id="nu-admin-id">${adminOptions}</select>
+           </div>`}
+      <button class="btn btn-primary" onclick="createUser()">Crear usuario</button>
+    </div>`;
+}
+
+function nuToggleAdmin(role) {
+  const field = document.getElementById('nu-admin-field');
+  if (field) field.style.display = role === 'STUDENT' ? '' : 'none';
+}
+
+async function createUser() {
+  const username  = document.getElementById('nu-username')?.value?.trim();
+  const password  = document.getElementById('nu-password')?.value;
+  const role      = document.getElementById('nu-role')?.value;
+  const adminIdEl = document.getElementById('nu-admin-id');
+  const admin_id  = adminIdEl ? parseInt(adminIdEl.value) || null : null;
+
+  if (!username || !password) { toast('Username y contraseña son requeridos', 'error'); return; }
+  if (role === 'STUDENT' && !admin_id) { toast('Selecciona un Slice Admin para el estudiante', 'error'); return; }
+  try {
+    const body = { username, password, role };
+    if (role === 'STUDENT' && admin_id) body.admin_id = admin_id;
+    await api('POST', '/auth/register', body);
+    toast(`Usuario "${username}" creado`, 'success');
+    renderUsers();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
 // ── Init ──────────────────────────────────────────────────────
 document.getElementById('login-form').addEventListener('submit', async e => {
   e.preventDefault();
@@ -1189,7 +1342,8 @@ Object.assign(window, {
   renderImages, uploadImage, deleteImage,
   // topology designer
   tdSetMode, tdAddVM, tdDeleteSelected, tdSubmit,
-  tdUpdateVm, tdUpdateLink,
+  tdUpdateVm, tdUpdateLink,tdLoadImages,
+  createUser, nuToggleAdmin,
 });
 
 // Auto-login si hay token guardado

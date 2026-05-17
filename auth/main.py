@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -45,6 +45,34 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
     await db.refresh(new_user)
     
     return new_user
+
+def _decode_caller(request: Request) -> dict:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token requerido")
+    try:
+        payload = jwt.decode(auth.split(" ", 1)[1], SECRET_KEY, algorithms=[ALGORITHM])
+        return {"id": int(payload["sub"]), "role": payload["role"]}
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+@app.get("/auth/admins")
+async def list_admins(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.role == "SLICE_ADMIN"))
+    admins = result.scalars().all()
+    return {"admins": [{"id": a.id, "username": a.username} for a in admins]}
+
+@app.get("/auth/users")
+async def list_users(request: Request, db: AsyncSession = Depends(get_db)):
+    caller = _decode_caller(request)
+    if caller["role"] == "SYSTEM_ADMIN":
+        result = await db.execute(select(User))
+    elif caller["role"] == "SLICE_ADMIN":
+        result = await db.execute(select(User).where(User.admin_id == caller["id"]))
+    else:
+        raise HTTPException(status_code=403, detail="Acceso denegado")
+    users = result.scalars().all()
+    return {"users": [{"id": u.id, "username": u.username, "role": u.role} for u in users]}
 
 @app.post("/auth/login", response_model=Token)
 async def login(user_data: UserLogin, db: AsyncSession = Depends(get_db)):
