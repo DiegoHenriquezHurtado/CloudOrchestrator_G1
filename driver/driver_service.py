@@ -56,7 +56,7 @@ class DriverService:
 
         # --- 1. Thin Provisioning ---
         base_path = f"/mnt/storage/base/{req.vm.base_image}"
-        commands.append(f"sudo qemu-img create -f qcow2 -b {base_path} {req.vm.instance_path}")
+        commands.append(f"sudo qemu-img create -f qcow2 -b {base_path} -F qcow2 {req.vm.instance_path}")
         rollback_actions.append(f"sudo rm -f {req.vm.instance_path}")
 
         # --- 2. Bridges idempotentes ---
@@ -71,10 +71,14 @@ class DriverService:
         # --- 3. TAPs con Vlan-Inner ---
         has_remote = False
         for iface in req.interfaces:
+            # Pre-crear el TAP para que OVS no falle al intentar agregarlo si no existe
+            commands.append(f"sudo ip tuntap add mode tap {iface.tap_name} 2>/dev/null || true")
+            commands.append(f"sudo ip link set {iface.tap_name} up")
+            
             if iface.vlan_inner and iface.vlan_inner > 0:
-                commands.append(f"sudo ovs-vsctl add-port {bridge_name} {iface.tap_name} tag={iface.vlan_inner}")
+                commands.append(f"sudo ovs-vsctl --may-exist add-port {bridge_name} {iface.tap_name} tag={iface.vlan_inner}")
             else:
-                commands.append(f"sudo ovs-vsctl add-port {bridge_name} {iface.tap_name}")
+                commands.append(f"sudo ovs-vsctl --may-exist add-port {bridge_name} {iface.tap_name}")
             rollback_actions.append(f"sudo ovs-vsctl --if-exists del-port {bridge_name} {iface.tap_name}")
             if iface.is_remote:
                 has_remote = True
@@ -111,44 +115,67 @@ class DriverService:
                 f"sudo ovs-vsctl set port ens4 vlan_mode=trunk"
             )
 
-        # --- 4.5. Generar Cloud-Init dinámico (ipv4ll y credenciales) ---
+        # --- 4.5. Generar Cloud-Init dinámico (Ubuntu/Debian) ---
+        # Se genera en NFS, añadiendo tiempos de espera para mitigar latencias de sincronizacion
         seed_path = f"/mnt/storage/instances/{req.vm.name}-seed.iso"
+        
+        # 1. user-data (Hostname, Passwords y SSH)
         commands.append(
             f"cat << 'EOF' > /tmp/user-data-{req.vm.name}\n"
             f"#cloud-config\n"
+            f"hostname: {req.vm.name}\n"
+            f"manage_etc_hosts: true\n"
             f"chpasswd:\n"
             f"  list: |\n"
             f"    root:root\n"
+            f"    ubuntu:ubuntu\n"
+            f"    debian:debian\n"
             f"  expire: False\n"
-            f"runcmd:\n"
-            f"  - sed -i '$a ipv4ll' /etc/dhcpcd.conf || echo 'ipv4ll' >> /etc/dhcpcd.conf\n"
-            f"  - sed -i '$a ipv4ll' /etc/network/interfaces || echo 'ipv4ll' >> /etc/network/interfaces\n"
-            f"  - rc-service dhcpcd restart\n"
-            f"  - rc-service networking restart\n"
+            f"ssh_pwauth: True\n"
             f"EOF"
         )
+        
+        # 2. meta-data (Hostnames)
         commands.append(f"echo -e 'instance-id: {req.vm.name}\\nlocal-hostname: {req.vm.name}' > /tmp/meta-data-{req.vm.name}")
+        
+        # 3. network-config (Version 1 - Universal por MAC Address)
+        # Ubuntu lo traduce a Netplan, Debian lo traduce a ENI + Udev Rules
+        sorted_ifaces = sorted(req.interfaces, key=lambda x: x.interface_name)
+        net_cfg = ["version: 1", "config:"]
+        for iface in sorted_ifaces:
+            net_cfg.extend([
+                f"  - type: physical",
+                f"    name: {iface.interface_name}",
+                f"    mac_address: '{iface.mac_address}'",
+                f"    subnets:",
+                f"      - type: static",
+                f"        address: {iface.ip_address}",
+                f"        netmask: 255.255.255.0"
+            ])
+        net_cfg_content = "\\n".join(net_cfg)
+        commands.append(f"echo -e '{net_cfg_content}' > /tmp/network-config-{req.vm.name}")
+        
+        # 4. Generar ISO usando cloud-localds (y agregar sleep para compensar la latencia del NFS)
         commands.append(
-            f"if command -v genisoimage >/dev/null 2>&1; then "
-            f"genisoimage -output {seed_path} -volid cidata -joliet -rock /tmp/user-data-{req.vm.name} /tmp/meta-data-{req.vm.name} 2>/dev/null; "
-            f"fi"
+            f"sudo cloud-localds --network-config=/tmp/network-config-{req.vm.name} {seed_path} /tmp/user-data-{req.vm.name} /tmp/meta-data-{req.vm.name}; "
+            f"sync; sleep 2"
         )
+        
+        # 5. Limpiar archivos temporales
+        commands.append(f"sudo rm -f /tmp/user-data-{req.vm.name} /tmp/meta-data-{req.vm.name} /tmp/network-config-{req.vm.name}")
 
         # --- 5. Lanzar QEMU ---
         vnc_display = req.vm.id
         vnc_port = 5900 + vnc_display
 
         qemu_parts = [
-            f"SEED_OPT=\"\"; if [ -f {seed_path} ]; then SEED_OPT=\"-drive file={seed_path},media=cdrom,readonly=on\"; elif [ -f /mnt/storage/base/seed.iso ]; then SEED_OPT=\"-drive file=/mnt/storage/base/seed.iso,media=cdrom,readonly=on\"; fi; "
+            f"SEED_OPT=\"\"; if [ -f {seed_path} ]; then SEED_OPT=\"-cdrom {seed_path}\"; elif [ -f /mnt/storage/base/seed.iso ]; then SEED_OPT=\"-cdrom /mnt/storage/base/seed.iso\"; fi; "
             "sudo qemu-system-x86_64 $SEED_OPT",
+            "-enable-kvm",
             f"-m {req.vm.ram}",
             f"-smp {req.vm.vcpu}",
-            f"-drive file={req.vm.instance_path},format=qcow2",
+            f"{req.vm.instance_path}",
         ]
-
-        # Ordenar interfaces por nombre (eth0, eth1, eth2...) para que QEMU
-        # asigne net0→eth0, net1→eth1, etc. dentro del guest
-        sorted_ifaces = sorted(req.interfaces, key=lambda x: x.interface_name)
 
         for i, iface in enumerate(sorted_ifaces):
             qemu_parts.append(f"-netdev tap,id=net{i},ifname={iface.tap_name},script=no,downscript=no")
@@ -163,7 +190,7 @@ class DriverService:
         qemu_cmd = " \\\n  ".join(qemu_parts)
         commands.append(qemu_cmd)
 
-        # --- 6. Levantar TAPs (QEMU los crea DOWN con script=no) ---
+        # --- 6. Levantar TAPs ---
         for iface in sorted_ifaces:
             commands.append(f"sudo ip link set {iface.tap_name} up")
 
@@ -173,10 +200,8 @@ class DriverService:
         # --- Ejecutar ---
         results = await execute_on_worker(req.worker_ip, commands)
 
-        # Verificar resultados
         failed_result = next((r for r in results if not r.success), None)
         if failed_result:
-            # Rollback
             rb_results = await self._rollback(req.worker_ip, rollback_actions)
             return ExecuteFailureResponse(
                 task_id=req.task_id,
@@ -185,7 +210,6 @@ class DriverService:
                 rollback_actions=[f"Executed: {r.command}" for r in rb_results],
             )
 
-        # Extraer PID del último comando (cat /tmp/VM.pid)
         pid_result = results[-1]
         process_id = int(pid_result.stdout.strip()) if pid_result.stdout.strip().isdigit() else None
 
@@ -221,7 +245,7 @@ class DriverService:
         for iface in req.interfaces:
             commands.append(f"sudo ovs-vsctl --if-exists del-port {bridge_name} {iface.tap_name}")
 
-        # 3.5. Remove dynamically generated seed.iso if exists
+        # 3.5. Remove dynamically generated seed.iso from NFS if exists
         commands.append(f"sudo rm -f /mnt/storage/instances/{req.vm.name}-seed.iso")
 
         # 5 y 6. Delete veth-ports and bridge ONLY if it's the last VM of the slice
