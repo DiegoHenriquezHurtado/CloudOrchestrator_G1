@@ -309,6 +309,7 @@ function renderNewSlice() {
               </button>
               <div style="width:1px;height:20px;background:var(--border)"></div>
               <button class="btn btn-ghost btn-sm" onclick="tdAddVM()">+ VM</button>
+              <button class="btn btn-ghost btn-sm" onclick="tdOpenTopoModal()">Plantilla</button>
               <button class="btn btn-danger btn-sm" onclick="tdDeleteSelected()">Eliminar</button>
             </div>
             <button class="btn btn-primary" onclick="tdSubmit()">Enviar solicitud</button>
@@ -340,6 +341,34 @@ function renderNewSlice() {
             <div><b style="color:var(--text-muted)">Editar</b> — selecciona una VM</div>
             <div><b style="color:var(--text-muted)">Borrar</b> — selecciona + Eliminar</div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal topología predefinida -->
+    <div id="td-topo-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.65);
+         z-index:1000;align-items:center;justify-content:center">
+      <div class="card" style="width:320px;margin:0;padding:20px 24px;gap:14px;display:flex;flex-direction:column">
+        <div class="card-title" style="margin-bottom:0">Topología predefinida</div>
+        <div class="field" style="margin:0">
+          <label>Tipo</label>
+          <select id="td-topo-type" style="width:100%">
+            <option value="ring">Anillo — cada VM conectada a la siguiente en círculo</option>
+            <option value="star">Estrella — un hub central conectado a todos los nodos</option>
+            <option value="line">Lineal — VMs en cadena de extremo a extremo</option>
+          </select>
+        </div>
+        <div class="field" style="margin:0">
+          <label>Número de VMs</label>
+          <input type="number" id="td-topo-n" value="4" min="2" max="20"
+                 style="width:100%;box-sizing:border-box" />
+        </div>
+        <p class="text-muted text-sm" style="margin:0">
+          Las VMs generadas usan los valores por defecto. Puedes editarlas individualmente y seguir añadiendo VMs o enlaces después.
+        </p>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn btn-ghost btn-sm" onclick="tdCloseTopoModal()">Cancelar</button>
+          <button class="btn btn-primary btn-sm" onclick="tdApplyTemplate()">Aplicar</button>
         </div>
       </div>
     </div>`;
@@ -557,7 +586,7 @@ function tdAddVM() {
   const id = TD.nextVmId++;
   TD.vms.push({
     id, name:`VM${id}`,
-    base_image:'ubuntu-22.04.qcow2', ram:1024, vcpu:1,
+    base_image:'', ram:1024, vcpu:1,
     x: 80 + Math.random()*(W-160),
     y: 60 + Math.random()*(H-120),
   });
@@ -576,6 +605,82 @@ function tdDeleteSelected() {
   }
   TD.selected = null;
   tdRenderProps(); tdUpdateSummary();
+}
+
+// ── Predefined topology generators ───────────────────────────
+function tdOpenTopoModal()  { document.getElementById('td-topo-modal').style.display = 'flex'; }
+function tdCloseTopoModal() { document.getElementById('td-topo-modal').style.display = 'none'; }
+
+function tdApplyTemplate() {
+  const type = document.getElementById('td-topo-type').value;
+  const n    = parseInt(document.getElementById('td-topo-n').value, 10);
+  const canvas = document.getElementById('td-canvas');
+  const W = canvas?.width || 600, H = canvas?.height || 400;
+
+  if (type === 'ring' && n < 3) { toast('Anillo requiere mínimo 3 VMs', 'error'); return; }
+  if (type === 'star' && n < 3) { toast('Estrella requiere mínimo 3 VMs', 'error'); return; }
+  if (type === 'line' && n < 2) { toast('Lineal requiere mínimo 2 VMs', 'error'); return; }
+  if (n > 20) { toast('Máximo 20 VMs por plantilla', 'error'); return; }
+
+  let result;
+  if (type === 'ring') result = tdGenerateRing(n, W, H);
+  else if (type === 'star') result = tdGenerateStar(n, W, H);
+  else result = tdGenerateLine(n, W, H);
+
+  TD.vms.push(...result.vms);
+  TD.links.push(...result.links);
+  TD.selected = null;
+  tdRenderProps(); tdUpdateSummary(); tdCloseTopoModal();
+  toast(`Plantilla aplicada: ${result.vms.length} VMs, ${result.links.length} enlaces`, 'success');
+}
+
+function tdGenerateRing(n, W, H) {
+  const cx = W / 2, cy = H / 2, r = Math.min(W, H) * 0.34;
+  const vms = [], links = [];
+  for (let i = 0; i < n; i++) {
+    const angle = (2 * Math.PI * i / n) - Math.PI / 2;
+    const id = TD.nextVmId++;
+    vms.push({ id, name: `VM${id}`, base_image: '', ram: 1024, vcpu: 1,
+      x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) });
+  }
+  for (let i = 0; i < n; i++) {
+    const id = TD.nextLinkId++;
+    links.push({ id, name: `link-${id}`, vmA: vms[i].id, vmB: vms[(i + 1) % n].id });
+  }
+  return { vms, links };
+}
+
+function tdGenerateStar(n, W, H) {
+  const cx = W / 2, cy = H / 2, r = Math.min(W, H) * 0.34;
+  const vms = [], links = [];
+  const hubId = TD.nextVmId++;
+  vms.push({ id: hubId, name: `VM${hubId}`, base_image: '', ram: 1024, vcpu: 1, x: cx, y: cy });
+  const spokes = n - 1;
+  for (let i = 0; i < spokes; i++) {
+    const angle = (2 * Math.PI * i / spokes) - Math.PI / 2;
+    const id = TD.nextVmId++;
+    vms.push({ id, name: `VM${id}`, base_image: '', ram: 1024, vcpu: 1,
+      x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) });
+    const lid = TD.nextLinkId++;
+    links.push({ id: lid, name: `link-${lid}`, vmA: hubId, vmB: id });
+  }
+  return { vms, links };
+}
+
+function tdGenerateLine(n, W, H) {
+  const margin = 90, cy = H / 2;
+  const step = n > 1 ? (W - margin * 2) / (n - 1) : 0;
+  const vms = [], links = [];
+  for (let i = 0; i < n; i++) {
+    const id = TD.nextVmId++;
+    vms.push({ id, name: `VM${id}`, base_image: '', ram: 1024, vcpu: 1,
+      x: margin + i * step, y: cy });
+    if (i > 0) {
+      const lid = TD.nextLinkId++;
+      links.push({ id: lid, name: `link-${lid}`, vmA: vms[i - 1].id, vmB: id });
+    }
+  }
+  return { vms, links };
 }
 
 function tdSetMode(mode) {
@@ -603,7 +708,7 @@ function tdRenderProps() {
         <input type="text" value="${vm.name}" oninput="tdUpdateVm(${vm.id},'name',this.value)" /></div>
       <div class="field"><label>Imagen base</label>
         <select id="td-img-${vm.id}" onchange="tdUpdateVm(${vm.id},'base_image',this.value)">
-          <option value="${vm.base_image}">${vm.base_image}</option>
+          <option value="" disabled selected>Cargando...</option>
         </select></div>
       <div class="field-row">
         <div class="field"><label>RAM (MB)</label>
@@ -619,8 +724,6 @@ function tdRenderProps() {
     const vB = TD.vms.find(v=>v.id===link.vmB)?.name||'?';
     panel.innerHTML = `
       <div class="card-title">Enlace</div>
-      <div class="field"><label>Nombre de la red</label>
-        <input type="text" value="${link.name}" oninput="tdUpdateLink(${link.id},'name',this.value)" /></div>
       <p class="text-muted text-sm" style="margin-top:6px">${vA} ↔ ${vB}</p>`;
   } else {
     panel.innerHTML = `<div class="card-title">Propiedades</div>
@@ -677,6 +780,54 @@ async function tdSubmit() {
   } catch(e) { toast(e.message,'error'); }
 }
 
+// ── Topology SVG preview (read-only) ─────────────────────────
+function renderTopoSVG(vms, topology) {
+  if (!vms || vms.length === 0) return '';
+  const W = 480, H = 240, cx = W / 2, cy = H / 2;
+  const r = vms.length === 1 ? 0 : Math.min(W, H) * 0.36;
+  const STATUS_COLOR = {
+    READY: '#22c55e', ACTIVE: '#22c55e',
+    IN_PROGRESS: '#06b6d4', PENDING: '#f59e0b',
+    PENDING_APPROVAL: '#94a3b8', FAILED: '#ef4444',
+  };
+
+  const pos = {};
+  vms.forEach((vm, i) => {
+    const angle = (2 * Math.PI * i / vms.length) - Math.PI / 2;
+    pos[vm.name] = { x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle), status: vm.status };
+  });
+
+  const lines = (topology || []).map(link => {
+    const a = pos[link.vm_a], b = pos[link.vm_b];
+    if (!a || !b) return '';
+    return `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}"
+              stroke="rgba(139,92,246,0.55)" stroke-width="1.8"/>`;
+  }).join('');
+
+  const nodes = vms.map(vm => {
+    const p = pos[vm.name];
+    const color = STATUS_COLOR[vm.status] || '#94a3b8';
+    return `
+      <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="22"
+              fill="#0d1525" stroke="${color}" stroke-width="1.8"/>
+      <text x="${p.x.toFixed(1)}" y="${p.y.toFixed(1)}"
+            text-anchor="middle" dominant-baseline="middle"
+            font-size="10" font-weight="600"
+            font-family="SFMono-Regular,Consolas,monospace" fill="${color}">${vm.name}</text>`;
+  }).join('');
+
+  const hasLinks = (topology || []).length > 0;
+  const hint = !hasLinks
+    ? `<text x="${cx}" y="${H - 10}" text-anchor="middle" font-size="10"
+             font-family="sans-serif" fill="rgba(148,163,184,0.45)">Sin enlaces registrados</text>`
+    : '';
+
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;border-radius:6px">
+    <rect width="${W}" height="${H}" rx="6" fill="#0a0f1e"/>
+    ${lines}${nodes}${hint}
+  </svg>`;
+}
+
 // ── Slice detail modal ────────────────────────────────────────
 async function viewSliceDetail(id) {
   try {
@@ -706,12 +857,16 @@ async function viewSliceDetail(id) {
           </table></div>` : '<p class="text-muted text-sm">Sin interfaces asignadas aún.</p>'}
       </div>`).join('') || '<p class="text-muted text-sm">No hay VMs.</p>';
 
+    const topoSVG = renderTopoSVG(s.vms, s.topology);
     openModal(`Slice #${s.id} — ${s.name}`, `
       <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap">
         ${badge(s.status)}
         <span class="text-muted text-sm">ID: ${s.id}</span>
         ${s.vlan_slice ? `<span class="text-muted text-sm">VLAN-Slice: ${s.vlan_slice}</span>` : ''}
       </div>
+      ${topoSVG ? `
+        <div class="card-title" style="margin-bottom:8px">Topología</div>
+        <div style="margin-bottom:20px">${topoSVG}</div>` : ''}
       <div class="card-title" style="margin-bottom:12px">Máquinas Virtuales</div>
       ${vmsHTML}
     `);
@@ -1169,14 +1324,21 @@ async function tdLoadImages(vmId, currentImage) {
   try {
     const data = await api('GET', '/images/');
     const images = data.images || [];
+    if (!images.length) {
+      sel.innerHTML = `<option value="" disabled selected>No hay imágenes disponibles</option>`;
+      return;
+    }
+    const validCurrent = images.find(img => img.name === currentImage);
+    const selected = validCurrent ? currentImage : images[0].name;
     sel.innerHTML = images.map(img =>
-      `<option value="${img.name}" ${img.name === currentImage ? 'selected' : ''}>${img.name}</option>`
+      `<option value="${img.name}" ${img.name === selected ? 'selected' : ''}>${img.name}</option>`
     ).join('');
-    if (!images.find(img => img.name === currentImage)) {
-      sel.insertAdjacentHTML('afterbegin', `<option value="${currentImage}" selected>${currentImage}</option>`);
+    if (selected !== currentImage) {
+      const vm = TD.vms.find(v => v.id === vmId);
+      if (vm) vm.base_image = selected;
     }
   } catch {
-    sel.innerHTML = `<option value="${currentImage}">${currentImage}</option>`;
+    sel.innerHTML = `<option value="" disabled selected>Error al cargar imágenes</option>`;
   }
 }
 
@@ -1342,7 +1504,8 @@ Object.assign(window, {
   renderImages, uploadImage, deleteImage,
   // topology designer
   tdSetMode, tdAddVM, tdDeleteSelected, tdSubmit,
-  tdUpdateVm, tdUpdateLink,tdLoadImages,
+  tdUpdateVm, tdUpdateLink, tdLoadImages,
+  tdOpenTopoModal, tdCloseTopoModal, tdApplyTemplate,
   createUser, nuToggleAdmin,
 });
 

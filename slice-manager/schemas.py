@@ -72,6 +72,7 @@ class SliceDetailResponse(BaseModel):
     name: str
     status: str
     vlan_slice: Optional[int]
+    topology: Optional[list] = None
     vms: List[VMDetail]
 
     class Config:

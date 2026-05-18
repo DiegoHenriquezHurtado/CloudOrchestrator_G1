@@ -197,6 +197,7 @@ async def get_slice(
         name=slice_obj.name,
         status=slice_obj.status,
         vlan_slice=slice_obj.vlan_slice,
+        topology=slice_obj.topology or [],
         vms=vms
     )
 
