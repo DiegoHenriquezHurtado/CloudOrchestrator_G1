@@ -7,8 +7,8 @@ CREATE TABLE users (
     password_hash VARCHAR(255) NOT NULL,
     role VARCHAR(20) DEFAULT 'STUDENT', -- STUDENT, SLICE_ADMIN, SYSTEM_ADMIN
     admin_id INT REFERENCES users(id), -- Para asignar un STUDENT a un SLICE_ADMIN
-    quota_ram INT DEFAULT 4096, -- Cuota de RAM en MB
-    quota_cpu INT DEFAULT 4, -- Cuota de cores
+    quota_ram INT DEFAULT 8192, -- Cuota de RAM en MB
+    quota_cpu INT DEFAULT 8, -- Cuota de cores
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

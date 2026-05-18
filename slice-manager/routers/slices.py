@@ -450,13 +450,20 @@ async def delete_slice(
     db: AsyncSession = Depends(get_db)
 ):
     user = await get_current_user(x_user_role, x_user_id, db)
+
+    if user.role not in ("SLICE_ADMIN", "SYSTEM_ADMIN"):
+        raise HTTPException(status_code=403, detail="Only SLICE_ADMIN or SYSTEM_ADMIN can delete slices")
+
     result = await db.execute(select(models.Slice).options(selectinload(models.Slice.vms), selectinload(models.Slice.networks)).where(models.Slice.id == id))
     slice_obj = result.scalar_one_or_none()
     if not slice_obj:
         raise HTTPException(status_code=404, detail="Slice not found")
 
-    if user.role == "STUDENT" and slice_obj.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    if user.role == "SLICE_ADMIN":
+        student_res = await db.execute(select(models.User).where(models.User.id == slice_obj.user_id))
+        student = student_res.scalar_one_or_none()
+        if not student or student.admin_id != user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to delete this student's slice")
 
     vms_count = len(slice_obj.vms)
     networks_count = len(slice_obj.networks)

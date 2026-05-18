@@ -251,7 +251,6 @@ async function renderMySlices() {
             <td>${badge(s.status)}</td>
             <td>
               <button class="btn btn-ghost btn-sm" onclick="viewSliceDetail(${s.id})">Ver detalle</button>
-              <button class="btn btn-danger btn-sm" onclick="deleteSlice(${s.id})">Eliminar</button>
             </td>
           </tr>`).join('')}
         </tbody>
@@ -362,6 +361,12 @@ function renderNewSlice() {
           <label>Número de VMs</label>
           <input type="number" id="td-topo-n" value="4" min="2" max="20"
                  style="width:100%;box-sizing:border-box" />
+        </div>
+        <div class="field" style="margin:0">
+          <label>Imagen base</label>
+          <select id="td-topo-img" style="width:100%">
+            <option value="" disabled selected>Selecciona una imagen</option>
+          </select>
         </div>
         <p class="text-muted text-sm" style="margin:0">
           Las VMs generadas usan los valores por defecto. Puedes editarlas individualmente y seguir añadiendo VMs o enlaces después.
@@ -608,12 +613,28 @@ function tdDeleteSelected() {
 }
 
 // ── Predefined topology generators ───────────────────────────
-function tdOpenTopoModal()  { document.getElementById('td-topo-modal').style.display = 'flex'; }
+async function tdOpenTopoModal() {
+  document.getElementById('td-topo-modal').style.display = 'flex';
+  const sel = document.getElementById('td-topo-img');
+  try {
+    const data = await api('GET', '/images/');
+    const images = data.images || [];
+    if (!images.length) {
+      sel.innerHTML = `<option value="" disabled selected>No hay imágenes disponibles</option>`;
+      return;
+    }
+    sel.innerHTML = `<option value="" disabled selected>Selecciona una imagen</option>` +
+      images.map(img => `<option value="${img.name}">${img.name}</option>`).join('');
+  } catch {
+    sel.innerHTML = `<option value="" disabled selected>Error al cargar imágenes</option>`;
+  }
+}
 function tdCloseTopoModal() { document.getElementById('td-topo-modal').style.display = 'none'; }
 
 function tdApplyTemplate() {
   const type = document.getElementById('td-topo-type').value;
   const n    = parseInt(document.getElementById('td-topo-n').value, 10);
+  const img  = document.getElementById('td-topo-img').value;
   const canvas = document.getElementById('td-canvas');
   const W = canvas?.width || 600, H = canvas?.height || 400;
 
@@ -621,11 +642,14 @@ function tdApplyTemplate() {
   if (type === 'star' && n < 3) { toast('Estrella requiere mínimo 3 VMs', 'error'); return; }
   if (type === 'line' && n < 2) { toast('Lineal requiere mínimo 2 VMs', 'error'); return; }
   if (n > 20) { toast('Máximo 20 VMs por plantilla', 'error'); return; }
+  if (!img) { toast('Selecciona una imagen base', 'error'); return; }
 
   let result;
   if (type === 'ring') result = tdGenerateRing(n, W, H);
   else if (type === 'star') result = tdGenerateStar(n, W, H);
   else result = tdGenerateLine(n, W, H);
+
+  result.vms.forEach(vm => vm.base_image = img);
 
   TD.vms.push(...result.vms);
   TD.links.push(...result.links);
@@ -953,7 +977,8 @@ async function renderAllSlices() {
           ${s.status === 'PENDING_APPROVAL'
             ? `<button class="btn btn-success btn-sm" onclick="approveSlice(${s.id})">Aprobar</button>
                <button class="btn btn-danger  btn-sm" onclick="rejectSlice(${s.id})">Rechazar</button>`
-            : ''}`
+            : ''}
+          <button class="btn btn-danger btn-sm" onclick="deleteSlice(${s.id})">Eliminar</button>`
       : s => `
           <button class="btn btn-ghost btn-sm" onclick="viewSliceDetail(${s.id})">Ver</button>
           <button class="btn btn-ghost  btn-sm" onclick="viewNetDetail(${s.id})">Red</button>
@@ -1329,14 +1354,10 @@ async function tdLoadImages(vmId, currentImage) {
       return;
     }
     const validCurrent = images.find(img => img.name === currentImage);
-    const selected = validCurrent ? currentImage : images[0].name;
-    sel.innerHTML = images.map(img =>
-      `<option value="${img.name}" ${img.name === selected ? 'selected' : ''}>${img.name}</option>`
+    const placeholder = `<option value="" disabled ${!validCurrent ? 'selected' : ''}>Selecciona una imagen</option>`;
+    sel.innerHTML = placeholder + images.map(img =>
+      `<option value="${img.name}" ${img.name === currentImage ? 'selected' : ''}>${img.name}</option>`
     ).join('');
-    if (selected !== currentImage) {
-      const vm = TD.vms.find(v => v.id === vmId);
-      if (vm) vm.base_image = selected;
-    }
   } catch {
     sel.innerHTML = `<option value="" disabled selected>Error al cargar imágenes</option>`;
   }
