@@ -21,6 +21,7 @@ from models import Task, VirtualMachine, Slice, Worker, Network, VmInterface
 logger = logging.getLogger("dispatcher")
 
 DRIVER_URL = os.getenv("DRIVER_URL", "http://driver:8088")
+OPENSTACK_DRIVER_URL = os.getenv("OPENSTACK_DRIVER_URL", "http://openstack-driver:8089")
 NETWORKING_URL = os.getenv("NETWORKING_URL", "http://networking:8085")
 STALE_TIMEOUT_MINUTES = int(os.getenv("STALE_TIMEOUT_MINUTES", "10"))
 
@@ -94,10 +95,116 @@ class DispatcherService:
         # 2. Load related entities
         vm = await self._get_vm(task.vm_id, db)
         slice_obj = await self._get_slice(task.slice_id, db)
-        worker = await self._get_worker(task.worker_id, db)
 
-        if not vm or not slice_obj or not worker:
-            raise ValueError(f"Missing entity: vm={task.vm_id}, slice={task.slice_id}, worker={task.worker_id}")
+        if not vm or not slice_obj:
+            raise ValueError(f"Missing entity: vm={task.vm_id}, slice={task.slice_id}")
+
+        # --- REDIRECCIÓN DE OPENSTACK ---
+        if slice_obj.iaas_target == "openstack":
+            # Si el slice/VM ya fue procesado y completado exitosamente por otra tarea del mismo slice
+            if vm.status == "READY":
+                task.status = "READY"
+                task.updated_at = datetime.utcnow()
+                await db.commit()
+                return {
+                    "task_id": task.id,
+                    "vm_id": vm.id,
+                    "status": "READY"
+                }
+
+            # Obtener todas las VMs del slice para verificar sus workers asignados
+            vms_res = await db.execute(
+                select(VirtualMachine).where(VirtualMachine.slice_id == slice_obj.id)
+            )
+            vms_list = vms_res.scalars().all()
+            
+            # Mapear worker_id -> hostname
+            worker_id_to_hostname = {}
+            for v_db in vms_list:
+                if v_db.worker_id and v_db.worker_id not in worker_id_to_hostname:
+                    w_res = await db.execute(select(Worker.hostname).where(Worker.id == v_db.worker_id))
+                    hname = w_res.scalar_one_or_none()
+                    if hname:
+                        worker_id_to_hostname[v_db.worker_id] = hname
+                        
+            # Modificar payload para añadir el campo "host" a cada VM
+            payload = dict(task.payload)
+            vms_payload = []
+            for vm_p in payload.get("vms", []):
+                vm_p_copy = dict(vm_p)
+                v_db = next((v for v in vms_list if v.name == vm_p_copy.get("name")), None)
+                if v_db and v_db.worker_id in worker_id_to_hostname:
+                    vm_p_copy["host"] = worker_id_to_hostname[v_db.worker_id]
+                vms_payload.append(vm_p_copy)
+            payload["vms"] = vms_payload
+
+            driver_url = f"{OPENSTACK_DRIVER_URL}/v1/vms/create"
+            logger.info(f"Enviando solicitud de creación de slice {slice_obj.name} a OpenStack Driver: {driver_url}")
+            
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                res = await client.post(driver_url, json=payload)
+                
+            driver_response = res.json()
+            
+            if res.status_code in [200, 201] and driver_response.get("status") == "READY":
+                # Provisión exitosa: actualizamos todas las VMs del slice
+                vms_res = await db.execute(
+                    select(VirtualMachine).where(VirtualMachine.slice_id == slice_obj.id)
+                )
+                vms_list = vms_res.scalars().all()
+                
+                returned_vms = {v["name"]: v for v in driver_response.get("vms", [])}
+                for v_db in vms_list:
+                    ret_vm = returned_vms.get(v_db.name)
+                    if ret_vm:
+                        v_db.status = "READY"
+                        v_db.instance_path = ret_vm.get("server_id")  # UUID del servidor en OpenStack
+                        v_db.vnc_url = ret_vm.get("vnc_url")
+                        
+                # Marcamos todas las tareas CREATE_VM del slice como READY
+                tasks_res = await db.execute(
+                    select(Task).where(Task.slice_id == slice_obj.id, Task.task_type == "CREATE_VM")
+                )
+                slice_tasks = tasks_res.scalars().all()
+                for t in slice_tasks:
+                    t.status = "READY"
+                    t.updated_at = datetime.utcnow()
+                    
+                await db.commit()
+                logger.info(f"Slice de OpenStack {slice_obj.name} completado con éxito en base de datos.")
+            else:
+                # Provisión fallida: marcamos todo como FAILED
+                error_detail = driver_response.get("detail", {})
+                error_msg = error_detail.get("message", f"OpenStack driver returned status code {res.status_code}") if isinstance(error_detail, dict) else str(error_detail)
+                
+                vms_res = await db.execute(
+                    select(VirtualMachine).where(VirtualMachine.slice_id == slice_obj.id)
+                )
+                for v_db in vms_res.scalars().all():
+                    v_db.status = "FAILED"
+                    
+                tasks_res = await db.execute(
+                    select(Task).where(Task.slice_id == slice_obj.id, Task.task_type == "CREATE_VM")
+                )
+                for t in tasks_res.scalars().all():
+                    t.status = "FAILED"
+                    t.error_msg = str(error_msg)[:500]
+                    t.updated_at = datetime.utcnow()
+                    
+                await db.commit()
+                logger.error(f"Fallo en aprovisionamiento de Slice de OpenStack: {error_msg}")
+                raise Exception(f"OpenStack provisioning failed: {error_msg}")
+
+            return {
+                "task_id": task.id,
+                "vm_id": vm.id,
+                "status": "READY"
+            }
+
+        # --- FLUJO ESTÁNDAR LINUX ---
+        worker = await self._get_worker(task.worker_id, db)
+        if not worker:
+            raise ValueError(f"Missing entity: worker={task.worker_id}")
 
         # 3. Ensure payload is enriched (fallback if Networking wasn't called)
         payload = task.payload or {}
@@ -119,7 +226,8 @@ class DispatcherService:
                 "base_image": vm.base_image,
                 "ram": vm.ram,
                 "vcpu": vm.vcpu,
-                "instance_path": payload.get("instance_path", f"/mnt/storage/instances/{vm.id}.qcow2"),
+                "disk": payload.get("disk", 0),
+                "instance_path": payload.get("instance_path", f"/mnt/storage/instances/{vm.id}.qcow2")
             },
             "slice": {
                 "id": slice_obj.id,
@@ -130,11 +238,9 @@ class DispatcherService:
                     "interface_name": iface.get("interface_name", ""),
                     "tap_name": iface.get("tap_name", ""),
                     "vlan_inner": iface.get("vlan_inner", 0),
-                    "ip_address": iface.get("ip_address", ""),
                     "mac_address": iface.get("mac_address", ""),
-                    "bridge_name": bridge_name,
+                    "bridge_name": iface.get("bridge_name") or bridge_name,
                     "is_remote": iface.get("is_remote", False),
-                    "internet_access": iface.get("internet_access", False),
                 }
                 for iface in payload.get("interfaces", [])
             ],
@@ -184,19 +290,20 @@ class DispatcherService:
 
         interfaces_payload = []
         for iface in ifaces:
-            net_res = await db.execute(
-                select(Network).where(Network.id == iface.network_id)
-            )
-            net = net_res.scalar_one_or_none()
+            net = None
+            if iface.network_id:
+                net_res = await db.execute(
+                    select(Network).where(Network.id == iface.network_id)
+                )
+                net = net_res.scalar_one_or_none()
             interfaces_payload.append({
                 "interface_name": iface.interface_name,
                 "tap_name": iface.tap_name,
                 "vlan_inner": net.vlan_inner if net else 0,
-                "ip_address": iface.ip_address,
                 "mac_address": iface.mac_address,
                 "network_id": iface.network_id,
+                "bridge_name": iface.bridge_name or f"br-sl-{slice_obj.id}",
                 "is_remote": net.is_remote if net else False,
-                "internet_access": net.internet_access if net else False,
             })
 
         instance_path = f"/mnt/storage/instances/{vm.id}.qcow2"
@@ -209,6 +316,7 @@ class DispatcherService:
             "instance_path": instance_path,
             "ram": vm.ram,
             "vcpu": vm.vcpu,
+            "disk": vm.disk,
             "slice_id": slice_obj.id,
             "vlan_slice": slice_obj.vlan_slice,
             "bridge_name": f"br-sl-{slice_obj.id}",
@@ -230,16 +338,17 @@ class DispatcherService:
         topology = slice_obj.topology or []
         networking_links = []
         for i, link in enumerate(topology):
-            vm_a_id = vm_name_to_id.get(link.get("vm_a"))
-            vm_b_id = vm_name_to_id.get(link.get("vm_b"))
-            if vm_a_id and vm_b_id:
+            vm_a_name = str(link.get("vm_a", "")).upper()
+            vm_b_name = str(link.get("vm_b", "")).upper()
+            vm_a_id = 0 if vm_a_name in ("INTERNET", "INET", "WAN", "EXTERNAL") else vm_name_to_id.get(link.get("vm_a"))
+            vm_b_id = 0 if vm_b_name in ("INTERNET", "INET", "WAN", "EXTERNAL") else vm_name_to_id.get(link.get("vm_b"))
+            if vm_a_id is not None and vm_b_id is not None:
                 networking_links.append({
                     "link_name": f"link_{i}",
                     "vm_a_id": vm_a_id,
                     "iface_a": link.get("iface_a", "eth0"),
                     "vm_b_id": vm_b_id,
                     "iface_b": link.get("iface_b", "eth0"),
-                    "internet_access": link.get("internet_access", False),
                 })
 
         payload = {

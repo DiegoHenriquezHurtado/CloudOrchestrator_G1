@@ -39,11 +39,9 @@ class DriverInterfacePayload(BaseModel):
     interface_name: str
     tap_name: str
     vlan_inner: int
-    ip_address: str
     mac_address: str
-    bridge_name: str
+    bridge_name: Optional[str] = None
     is_remote: bool
-    internet_access: bool = False
 
 class DriverExecuteRequest(BaseModel):
     task_id: int
@@ -54,6 +52,3 @@ class DriverExecuteRequest(BaseModel):
     interfaces: List[DriverInterfacePayload] = []
     # DELETE_VM extras
     process_id: Optional[int] = None
-    # APPLY_SECURITY extras
-    setup_flows: Optional[List[Dict[str, str]]] = None
-    policy_flows: Optional[List[Dict[str, str]]] = None

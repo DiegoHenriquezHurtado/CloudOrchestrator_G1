@@ -8,8 +8,8 @@ from models import Worker, User, Slice, VirtualMachine
 from ssh_client import get_worker_metrics, SSH_ENABLED
 
 async def update_all_workers_metrics(session: AsyncSession):
-    # Fetch all workers
-    result = await session.execute(select(Worker))
+    # Fetch only linux workers
+    result = await session.execute(select(Worker).where(Worker.cluster_type == 'linux'))
     workers = result.scalars().all()
 
     for worker in workers:

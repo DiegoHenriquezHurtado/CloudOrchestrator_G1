@@ -12,8 +12,6 @@ class UserResponse(BaseModel):
     username: str
     role: str
     admin_id: Optional[int] = None
-    quota_ram: int
-    quota_cpu: int
 
 class UserLogin(BaseModel):
     username: str

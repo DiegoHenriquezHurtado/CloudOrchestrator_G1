@@ -62,37 +62,18 @@ class PlacementService:
             )
             vm = vm_result.scalar_one()
 
-            # Quota validation
             slice_result = await db.execute(select(Slice).where(Slice.id == task.slice_id))
             slice_obj = slice_result.scalar_one()
-            
-            user_result = await db.execute(select(User).where(User.id == slice_obj.user_id))
-            user_obj = user_result.scalar_one()
-
-            # Calculate total used resources for this user across all their slices
-            total_allocated_query = select(
-                func.coalesce(func.sum(VirtualMachine.ram), 0),
-                func.coalesce(func.sum(VirtualMachine.vcpu), 0)
-            ).select_from(VirtualMachine).join(Slice, VirtualMachine.slice_id == Slice.id).where(
-                Slice.user_id == user_obj.id,
-                Slice.status.notin_(['FAILED', 'DELETED'])
-            )
-            total_alloc_res = await db.execute(total_allocated_query)
-            total_ram_used, total_cpu_used = total_alloc_res.first()
-
-            if total_ram_used > user_obj.quota_ram or total_cpu_used > user_obj.quota_cpu:
-                skipped.append({
-                    "task_id": task.id,
-                    "reason": f"User quota exceeded (RAM: {total_ram_used}/{user_obj.quota_ram}, CPU: {total_cpu_used}/{user_obj.quota_cpu})"
-                })
-                continue
 
             selected = None
 
+            # Filter workers by cluster type matching slice's iaas_target
+            target_workers = [w for w in workers if w.cluster_type == slice_obj.iaas_target]
+
             # Robust Round Robin using indexed array
-            sorted_workers = sorted(workers, key=lambda w: w.id)
+            sorted_workers = sorted(target_workers, key=lambda w: w.id)
             if not sorted_workers:
-                skipped.append({"task_id": task.id, "reason": "No workers available in inventory"})
+                skipped.append({"task_id": task.id, "reason": f"No workers available in inventory for target {slice_obj.iaas_target}"})
                 continue
                 
             last_idx = -1

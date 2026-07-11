@@ -9,6 +9,4 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), default="STUDENT")
     admin_id = Column(Integer, ForeignKey("users.id"))
-    quota_ram = Column(Integer, default=8192)
-    quota_cpu = Column(Integer, default=8)
     created_at = Column(DateTime, server_default=func.now())

@@ -10,8 +10,16 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), default="STUDENT")
     admin_id = Column(Integer, ForeignKey("users.id"))
-    quota_ram = Column(Integer, default=4096)
-    quota_cpu = Column(Integer, default=4)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Flavor(Base):
+    __tablename__ = "flavors"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), unique=True, nullable=False)
+    ram = Column(Integer, nullable=False)
+    vcpu = Column(Integer, nullable=False)
+    disk = Column(Integer, nullable=False)
+    allowed_role = Column(String(20), default="STUDENT")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class VlanPool(Base):
@@ -28,6 +36,7 @@ class Slice(Base):
     vlan_slice = Column(Integer, ForeignKey("vlan_pool.vlan_id"))
     topology = Column(JSON)  # Links originales de la topología (persistido para approve)
     status = Column(String(20), default="PENDING_APPROVAL")
+    iaas_target = Column(String(20), default="linux")
     created_at = Column(DateTime, default=datetime.utcnow)
     
     vms = relationship("VirtualMachine", back_populates="slice", cascade="all, delete", passive_deletes=True)
@@ -42,11 +51,14 @@ class VirtualMachine(Base):
     base_image = Column(String(100), nullable=False)
     ram = Column(Integer, nullable=False)
     vcpu = Column(Integer, nullable=False)
+    disk = Column(Integer, nullable=True)
+    flavor = Column(String(100), nullable=True)
     worker_id = Column(Integer)
     process_id = Column(Integer)
     vnc_port = Column(Integer)
     instance_path = Column(String(255))
     status = Column(String(20), default="PENDING_APPROVAL")
+    vnc_url = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     slice = relationship("Slice", back_populates="vms")
@@ -58,9 +70,7 @@ class Network(Base):
     id = Column(Integer, primary_key=True, index=True)
     slice_id = Column(Integer, ForeignKey("slices.id", ondelete="CASCADE"))
     vlan_inner = Column(Integer, nullable=False)
-    subnet_cidr = Column(String(18))
     is_remote = Column(Boolean, default=False)
-    internet_access = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     slice = relationship("Slice", back_populates="networks")
@@ -69,11 +79,11 @@ class VmInterface(Base):
     __tablename__ = "vm_interfaces"
     id = Column(Integer, primary_key=True, index=True)
     vm_id = Column(Integer, ForeignKey("virtual_machines.id", ondelete="CASCADE"))
-    network_id = Column(Integer, ForeignKey("networks.id", ondelete="CASCADE"))
+    network_id = Column(Integer, ForeignKey("networks.id", ondelete="CASCADE"), nullable=True)
     mac_address = Column(String(17))
-    ip_address = Column(String(15))
     interface_name = Column(String(20))
     tap_name = Column(String(30))
+    bridge_name = Column(String(30), nullable=True)
 
     vm = relationship("VirtualMachine", back_populates="interfaces")
 

@@ -14,6 +14,7 @@ class Worker(Base):
     current_cpu_load: Mapped[float] = mapped_column(DECIMAL(5, 2), default=0.0)
     current_ram_available: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="ALIVE")
+    cluster_type: Mapped[str] = mapped_column(String(20), default="linux")
     updated_at: Mapped[datetime.datetime] = mapped_column(
         TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP")
     )

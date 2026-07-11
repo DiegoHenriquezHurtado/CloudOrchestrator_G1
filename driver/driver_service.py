@@ -38,8 +38,6 @@ class DriverService:
             return await self._create_vm(request)
         elif request.task_type == "DELETE_VM":
             return await self._delete_vm(request)
-        elif request.task_type == "APPLY_SECURITY":
-            return await self._apply_security(request)
         else:
             return ExecuteFailureResponse(
                 task_id=request.task_id,
@@ -57,31 +55,78 @@ class DriverService:
         # --- 1. Thin Provisioning ---
         base_path = f"/mnt/storage/base/{req.vm.base_image}"
         commands.append(f"sudo qemu-img create -f qcow2 -b {base_path} -F qcow2 {req.vm.instance_path}")
+        if req.vm.disk > 0:
+            commands.append(f"sudo qemu-img resize {req.vm.instance_path} {req.vm.disk}G")
         rollback_actions.append(f"sudo rm -f {req.vm.instance_path}")
+
+        # --- 1.5. Cloud-Init Ligero (Credenciales y Hostname sin red) ---
+        seed_path = f"/mnt/storage/instances/{req.vm.name}-seed.iso"
+        user_data_path = f"/tmp/user-data-{req.vm.name}"
+        meta_data_path = f"/tmp/meta-data-{req.vm.name}"
+
+        user_data_content = f"""#cloud-config
+hostname: {req.vm.name}
+manage_etc_hosts: true
+users:
+  - default
+  - name: cloudg1
+    gecos: Cloud G1 User
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo, users]
+    lock_passwd: false
+chpasswd:
+  list: |
+    root:root
+    cloudg1:cloudg1
+    debian:debian
+    ubuntu:ubuntu
+  expire: False
+ssh_pwauth: True
+"""
+        meta_data_content = f"""instance-id: {req.vm.name}-{req.vm.id}
+local-hostname: {req.vm.name}
+"""
+        commands.append(f"cat << 'EOF' > {user_data_path}\n{user_data_content}EOF")
+        commands.append(f"cat << 'EOF' > {meta_data_path}\n{meta_data_content}EOF")
+        commands.append(f"sudo cloud-localds {seed_path} {user_data_path} {meta_data_path}; sync; sleep 10")
+        commands.append(f"sudo rm -f {user_data_path} {meta_data_path}")
+        rollback_actions.append(f"sudo rm -f {seed_path} {user_data_path} {meta_data_path}")
 
         # --- 2. Bridges idempotentes ---
         commands.append("sudo ovs-vsctl --may-exist add-br br-wk")
         commands.append("sudo ovs-vsctl --may-exist add-port br-wk ens4")
 
+        # Configuración NAT / Internet Plug & Play en Worker
+        commands.append("sudo ovs-vsctl --may-exist add-br br-inet")
+        commands.append("sudo ip addr add 172.16.0.1/24 dev br-inet 2>/dev/null || true")
+        commands.append("sudo ip link set br-inet up")
+        commands.append("sudo sysctl -w net.ipv4.ip_forward=1")
+        commands.append("sudo iptables -t nat -C POSTROUTING -s 172.16.0.0/24 -o ens3 -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o ens3 -j MASQUERADE")
+        commands.append("sudo iptables -C FORWARD -s 172.16.0.0/24 -d 192.168.201.0/24 -j DROP 2>/dev/null || sudo iptables -I FORWARD 1 -s 172.16.0.0/24 -d 192.168.201.0/24 -j DROP")
+        commands.append("sudo iptables -C FORWARD -s 172.16.0.0/24 -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -s 172.16.0.0/24 -j ACCEPT")
+        commands.append("sudo iptables -C FORWARD -d 172.16.0.0/24 -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -d 172.16.0.0/24 -j ACCEPT")
+        commands.append("pgrep -f 'dnsmasq.*br-inet' >/dev/null || sudo dnsmasq --interface=br-inet --listen-address=172.16.0.1 --bind-interfaces --port=0 --dhcp-option=6,8.8.8.8,1.1.1.1 --dhcp-range=172.16.0.10,172.16.0.250,255.255.255.0,12h 2>/dev/null || true")
+
         bridge_name = f"br-sl-{req.slice.id}"
-        if req.interfaces:
-            bridge_name = req.interfaces[0].bridge_name
-        commands.append(f"sudo ovs-vsctl --may-exist add-br {bridge_name}")
+        for iface in req.interfaces:
+            br = iface.bridge_name or bridge_name
+            commands.append(f"sudo ovs-vsctl --may-exist add-br {br}")
 
         # --- 3. TAPs con Vlan-Inner ---
         has_remote = False
         for iface in req.interfaces:
-            # Pre-crear el TAP para que OVS no falle al intentar agregarlo si no existe
+            br = iface.bridge_name or bridge_name
             commands.append(f"sudo ip tuntap add mode tap {iface.tap_name} 2>/dev/null || true")
             commands.append(f"sudo ip link set {iface.tap_name} up")
             
             if iface.vlan_inner and iface.vlan_inner > 0:
-                commands.append(f"sudo ovs-vsctl --may-exist add-port {bridge_name} {iface.tap_name} tag={iface.vlan_inner}")
+                commands.append(f"sudo ovs-vsctl --may-exist add-port {br} {iface.tap_name} tag={iface.vlan_inner}")
             else:
-                commands.append(f"sudo ovs-vsctl --may-exist add-port {bridge_name} {iface.tap_name}")
-            rollback_actions.append(f"sudo ovs-vsctl --if-exists del-port {bridge_name} {iface.tap_name}")
-            if iface.is_remote:
+                commands.append(f"sudo ovs-vsctl --may-exist add-port {br} {iface.tap_name}")
+            rollback_actions.append(f"sudo ovs-vsctl --if-exists del-port {br} {iface.tap_name}")
+            if iface.is_remote and br != "br-inet":
                 has_remote = True
+
 
         # --- 4. Patch Ports + QinQ (solo si hay enlaces remotos) ---
         # Modelo del ejemplo QinQ:
@@ -115,66 +160,18 @@ class DriverService:
                 f"sudo ovs-vsctl set port ens4 vlan_mode=trunk"
             )
 
-        # --- 4.5. Generar Cloud-Init dinámico (Ubuntu/Debian) ---
-        # Se genera en NFS, añadiendo tiempos de espera para mitigar latencias de sincronizacion
-        seed_path = f"/mnt/storage/instances/{req.vm.name}-seed.iso"
-        
-        # 1. user-data (Hostname, Passwords y SSH)
-        commands.append(
-            f"cat << 'EOF' > /tmp/user-data-{req.vm.name}\n"
-            f"#cloud-config\n"
-            f"hostname: {req.vm.name}\n"
-            f"manage_etc_hosts: true\n"
-            f"chpasswd:\n"
-            f"  list: |\n"
-            f"    root:root\n"
-            f"    ubuntu:ubuntu\n"
-            f"    debian:debian\n"
-            f"  expire: False\n"
-            f"ssh_pwauth: True\n"
-            f"EOF"
-        )
-        
-        # 2. meta-data (Hostnames)
-        commands.append(f"echo -e 'instance-id: {req.vm.name}\\nlocal-hostname: {req.vm.name}' > /tmp/meta-data-{req.vm.name}")
-        
-        # 3. network-config (Version 1 - Universal por MAC Address)
-        # Ubuntu lo traduce a Netplan, Debian lo traduce a ENI + Udev Rules
-        sorted_ifaces = sorted(req.interfaces, key=lambda x: x.interface_name)
-        net_cfg = ["version: 1", "config:"]
-        for iface in sorted_ifaces:
-            net_cfg.extend([
-                f"  - type: physical",
-                f"    name: {iface.interface_name}",
-                f"    mac_address: '{iface.mac_address}'",
-                f"    subnets:",
-                f"      - type: static",
-                f"        address: {iface.ip_address}",
-                f"        netmask: 255.255.255.0"
-            ])
-        net_cfg_content = "\\n".join(net_cfg)
-        commands.append(f"echo -e '{net_cfg_content}' > /tmp/network-config-{req.vm.name}")
-        
-        # 4. Generar ISO usando cloud-localds (y agregar sleep para compensar la latencia del NFS)
-        commands.append(
-            f"sudo cloud-localds --network-config=/tmp/network-config-{req.vm.name} {seed_path} /tmp/user-data-{req.vm.name} /tmp/meta-data-{req.vm.name}; "
-            f"sync; sleep 2"
-        )
-        
-        # 5. Limpiar archivos temporales
-        commands.append(f"sudo rm -f /tmp/user-data-{req.vm.name} /tmp/meta-data-{req.vm.name} /tmp/network-config-{req.vm.name}")
-
         # --- 5. Lanzar QEMU ---
         vnc_display = req.vm.id
         vnc_port = 5900 + vnc_display
+        sorted_ifaces = sorted(req.interfaces, key=lambda x: x.interface_name)
 
         qemu_parts = [
-            f"SEED_OPT=\"\"; if [ -f {seed_path} ]; then SEED_OPT=\"-cdrom {seed_path}\"; elif [ -f /mnt/storage/base/seed.iso ]; then SEED_OPT=\"-cdrom /mnt/storage/base/seed.iso\"; fi; "
-            "sudo qemu-system-x86_64 $SEED_OPT",
+            "sudo qemu-system-x86_64",
             "-enable-kvm",
             f"-m {req.vm.ram}",
             f"-smp {req.vm.vcpu}",
             f"{req.vm.instance_path}",
+            f"-drive file={seed_path},media=cdrom,readonly=on",
         ]
 
         for i, iface in enumerate(sorted_ifaces):
@@ -231,22 +228,18 @@ class DriverService:
         if req.process_id:
             commands.append(f"sudo kill {req.process_id} 2>/dev/null || true")
 
-        # 2. Remove instance disk
-        commands.append(f"sudo rm -f {req.vm.instance_path}")
+        # 2. Remove instance disk & seed iso
+        commands.append(f"sudo rm -f {req.vm.instance_path} /mnt/storage/instances/{req.vm.name}-seed.iso /tmp/user-data-{req.vm.name} /tmp/meta-data-{req.vm.name}")
 
         # 3. Remove pidfile
         commands.append(f"sudo rm -f /tmp/{req.vm.name}.pid")
 
         # 4. Delete TAPs
         bridge_name = f"br-sl-{req.slice.id}"
-        if req.interfaces:
-            bridge_name = req.interfaces[0].bridge_name
-
         for iface in req.interfaces:
-            commands.append(f"sudo ovs-vsctl --if-exists del-port {bridge_name} {iface.tap_name}")
-
-        # 3.5. Remove dynamically generated seed.iso from NFS if exists
-        commands.append(f"sudo rm -f /mnt/storage/instances/{req.vm.name}-seed.iso")
+            br = iface.bridge_name or bridge_name
+            commands.append(f"sudo ovs-vsctl --if-exists del-port {br} {iface.tap_name}")
+            commands.append(f"sudo ip link delete {iface.tap_name} 2>/dev/null || true")
 
         # 5 y 6. Delete veth-ports and bridge ONLY if it's the last VM of the slice
         veth_wk = f"veth-wk-{req.slice.id}"
@@ -277,46 +270,7 @@ class DriverService:
             commands_executed=[r.command for r in results],
         )
 
-    # ==================================================================
-    # APPLY_SECURITY
-    # ==================================================================
-    async def _apply_security(self, req: ExecuteRequest):
-        commands = []
-        bridge_name = f"br-sl-{req.slice.id}"
 
-        # 1. Setup flows (ARP allow + default-deny IP)
-        for flow_entry in (req.setup_flows or []):
-            bridge = flow_entry.get("bridge", bridge_name)
-            flow = flow_entry.get("flow", "")
-            if flow:
-                commands.append(f'sudo ovs-ofctl add-flow {bridge} "{flow}"')
-
-        # 2. Policy flows (user rules from security_rules)
-        for flow_entry in (req.policy_flows or []):
-            bridge = flow_entry.get("bridge", bridge_name)
-            flow = flow_entry.get("flow", "")
-            if flow:
-                commands.append(f'sudo ovs-ofctl add-flow {bridge} "{flow}"')
-
-        # 3. NAT commands for networks with internet_access
-        nat_commands = await self._fetch_nat_commands(req.slice.id)
-        commands.extend(nat_commands)
-
-        results = await execute_on_worker(req.worker_ip, commands)
-
-        failed = next((r for r in results if not r.success), None)
-        if failed:
-            return ExecuteFailureResponse(
-                task_id=req.task_id,
-                status="FAILED",
-                error_msg=f"Security failed: {failed.command[:100]} — {failed.stderr[:200]}",
-            )
-
-        return ExecuteSuccessResponse(
-            task_id=req.task_id,
-            status="READY",
-            commands_executed=[r.command for r in results],
-        )
 
     # ==================================================================
     # Helpers
@@ -329,17 +283,3 @@ class DriverService:
         results = await execute_on_worker(worker_ip, list(reversed(actions)))
         return results
 
-    async def _fetch_nat_commands(self, slice_id: int) -> List[str]:
-        """Consulta GET /networking/nat/commands/{slice_id} para comandos iptables."""
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.get(f"{NETWORKING_URL}/networking/nat/commands/{slice_id}")
-                if res.status_code == 200:
-                    data = res.json()
-                    commands = []
-                    for net in data.get("nat_networks", []):
-                        commands.extend(net.get("commands", []))
-                    return commands
-        except httpx.RequestError as e:
-            logger.warning(f"NAT commands fetch failed: {e}")
-        return []

@@ -7,8 +7,16 @@ CREATE TABLE users (
     password_hash VARCHAR(255) NOT NULL,
     role VARCHAR(20) DEFAULT 'STUDENT', -- STUDENT, SLICE_ADMIN, SYSTEM_ADMIN
     admin_id INT REFERENCES users(id), -- Para asignar un STUDENT a un SLICE_ADMIN
-    quota_ram INT DEFAULT 8192, -- Cuota de RAM en MB
-    quota_cpu INT DEFAULT 8, -- Cuota de cores
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE flavors (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    ram INT NOT NULL,
+    vcpu INT NOT NULL,
+    disk INT NOT NULL,
+    allowed_role VARCHAR(20) DEFAULT 'STUDENT',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -21,6 +29,7 @@ CREATE TABLE workers (
     current_cpu_load DECIMAL(5,2) DEFAULT 0.0,
     current_ram_available INT DEFAULT 0,
     status VARCHAR(20) DEFAULT 'ALIVE', -- ALIVE o DOWN
+    cluster_type VARCHAR(20) DEFAULT 'linux', -- 'linux' o 'openstack'
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -39,6 +48,7 @@ CREATE TABLE slices (
     vlan_slice INT REFERENCES vlan_pool(vlan_id), -- Vlan-Slice: etiqueta de transporte inter-worker (una por Slice)
     topology JSONB, -- Links originales de la topología del alumno (persistido para la fase de aprobación)
     status VARCHAR(20) DEFAULT 'PENDING_APPROVAL', -- PENDING_APPROVAL, ACTIVE, FAILED, etc.
+    iaas_target VARCHAR(20) DEFAULT 'linux', -- 'linux' o 'openstack'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -49,11 +59,14 @@ CREATE TABLE virtual_machines (
     base_image VARCHAR(100) NOT NULL,
     ram INT NOT NULL, -- RAM asignada
     vcpu INT NOT NULL, -- Cores asignados
+    disk INT, -- Disco asignado
+    flavor VARCHAR(100), -- Sabor en OpenStack (Fase 2)
     worker_id INT REFERENCES workers(id),
     process_id INT, -- PID reportado por el Driver
     vnc_port INT,   -- Puerto VNC reportado
     instance_path VARCHAR(255), -- Ruta del disco qcow2 en el Server 4 (NFS/Shared Storage)
     status VARCHAR(20) DEFAULT 'PENDING_APPROVAL',
+    vnc_url VARCHAR(500), -- URL VNC para OpenStack
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -62,9 +75,7 @@ CREATE TABLE networks (
     id SERIAL PRIMARY KEY,
     slice_id INT REFERENCES slices(id) ON DELETE CASCADE,
     vlan_inner INT NOT NULL, -- Vlan-Inner: etiqueta local dentro del Br-Slice (ej. 100, 200)
-    subnet_cidr VARCHAR(18), -- ej. '192.168.100.0/24' (IPAM)
     is_remote BOOLEAN DEFAULT FALSE, -- TRUE si las VMs del enlace están en Workers distintos
-    internet_access BOOLEAN DEFAULT FALSE, -- TRUE habilita NAT/MASQUERADE para salida a Internet
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -72,11 +83,11 @@ CREATE TABLE networks (
 CREATE TABLE vm_interfaces (
     id SERIAL PRIMARY KEY,
     vm_id INT REFERENCES virtual_machines(id) ON DELETE CASCADE,
-    network_id INT REFERENCES networks(id) ON DELETE CASCADE,
+    network_id INT REFERENCES networks(id) ON DELETE CASCADE NULL,
     mac_address VARCHAR(17),
-    ip_address VARCHAR(15), -- IP asignada en esa red (IPAM y Dashboards)
     interface_name VARCHAR(20), -- ej. 'eth0', 'eth1' dentro del guest (VM)
-    tap_name VARCHAR(30) -- ej. 'tap-vm1-eth0' en el host Worker para OvS
+    tap_name VARCHAR(30), -- ej. 'tap-vm1-eth0' en el host Worker para OvS
+    bridge_name VARCHAR(30)
 );
 
 CREATE TABLE tasks (
@@ -92,19 +103,7 @@ CREATE TABLE tasks (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Reglas de seguridad entre VMs dentro de un slice (enforcement via OpenFlow en OvS)
-CREATE TABLE security_rules (
-    id SERIAL PRIMARY KEY,
-    slice_id INT REFERENCES slices(id) ON DELETE CASCADE,
-    src_vm_id INT REFERENCES virtual_machines(id) ON DELETE CASCADE,
-    dst_vm_id INT REFERENCES virtual_machines(id) ON DELETE CASCADE,
-    protocol VARCHAR(10) DEFAULT 'any',   -- tcp, udp, icmp, any
-    port_min INT,                         -- NULL = cualquier puerto
-    port_max INT,
-    action VARCHAR(10) DEFAULT 'ALLOW',   -- ALLOW, DENY
-    priority INT DEFAULT 100,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+
 
 -- Tabla de configuración clave-valor para estado persistente de los módulos
 -- Ej: el puntero Round Robin del VM Placement ('last_worker_id' -> '2')
@@ -120,11 +119,14 @@ INSERT INTO vlan_pool (vlan_id) SELECT generate_series(100, 1000);
 -- Semilla de Workers: solo inventario estático (hostname + IP de gestión).
 -- El módulo de Monitoring descubrirá total_ram, total_cpu vía SSH
 -- y actualizará periódicamente current_cpu_load, current_ram_available y status.
-INSERT INTO workers (hostname, ip_management, total_ram, total_cpu)
+INSERT INTO workers (hostname, ip_management, total_ram, total_cpu, current_ram_available, cluster_type)
 VALUES
-    ('server1', '10.0.10.1', 0, 0),
-    ('server2', '10.0.10.2', 0, 0),
-    ('server3', '10.0.10.3', 0, 0);
+    ('server1', '10.0.10.1', 0, 0, 0, 'linux'),
+    ('server2', '10.0.10.2', 0, 0, 0, 'linux'),
+    ('server3', '10.0.10.3', 0, 0, 0, 'linux'),
+    ('worker1', '192.168.202.2', 8192, 8, 8192, 'openstack'),
+    ('worker2', '192.168.202.3', 8192, 8, 8192, 'openstack'),
+    ('worker3', '192.168.202.4', 8192, 8, 8192, 'openstack');
 
 -- Puntero inicial de Round Robin
 INSERT INTO config (key, value) VALUES ('last_worker_id', '0');

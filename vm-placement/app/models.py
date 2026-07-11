@@ -9,8 +9,6 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
-    quota_ram = Column(Integer)
-    quota_cpu = Column(Integer)
 
 
 class Slice(Base):
@@ -19,6 +17,7 @@ class Slice(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     status = Column(String)
+    iaas_target = Column(String)
 
 
 class Worker(Base):
@@ -30,6 +29,7 @@ class Worker(Base):
     total_cpu = Column(Integer)
     current_ram_available = Column(Integer)
     current_cpu_load = Column(DECIMAL)
+    cluster_type = Column(String, default="linux")
 
 
 class Task(Base):

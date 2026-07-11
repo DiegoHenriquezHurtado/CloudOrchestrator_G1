@@ -13,10 +13,11 @@ from typing import List, Dict, Optional
 
 logger = logging.getLogger("driver.ssh")
 
-SSH_ENABLED = os.getenv("SSH_ENABLED", "false").lower() == "true"
+SSH_ENABLED = os.getenv("SSH_ENABLED", "true").lower() == "true"
 SSH_USER = os.getenv("SSH_USER", "ubuntu")
 SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "/root/.ssh/id_rsa")
 SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", "30"))
+SSH_BASTION_HOST = os.getenv("SSH_BASTION_HOST", "192.168.203.4")
 
 
 class CommandResult:
@@ -64,40 +65,56 @@ async def _ssh_execute(worker_ip: str, commands: List[str]) -> List[CommandResul
         else:
             connect_kwargs["password"] = os.getenv("SSH_PASSWORD", "ubuntu")
 
-        async with asyncssh.connect(**connect_kwargs) as conn:
-            for cmd in commands:
-                logger.info(f"[{worker_ip}] $ {cmd}")
-                try:
-                    result = await asyncio.wait_for(
-                        conn.run(cmd, check=False),
-                        timeout=SSH_TIMEOUT
-                    )
-                    cr = CommandResult(
-                        command=cmd,
-                        stdout=result.stdout.strip() if result.stdout else "",
-                        stderr=result.stderr.strip() if result.stderr else "",
-                        exit_code=result.exit_status or 0,
-                    )
-                    results.append(cr)
-
-                    if cr.exit_code != 0:
-                        logger.warning(f"[{worker_ip}] Command failed (exit={cr.exit_code}): {cmd}")
-                        logger.warning(f"  stderr: {cr.stderr[:200]}")
-                        break  # Detener ante fallo
-
-                except asyncio.TimeoutError:
-                    results.append(CommandResult(cmd, stderr="Timeout", exit_code=124))
-                    break
+        # Si hay Bastion configurado y el objetivo no es el propio Bastion ni local
+        if SSH_BASTION_HOST and worker_ip not in [SSH_BASTION_HOST, "localhost", "127.0.0.1"]:
+            bastion_kwargs = connect_kwargs.copy()
+            bastion_kwargs["host"] = SSH_BASTION_HOST
+            logger.debug(f"Connecting to bastion {SSH_BASTION_HOST} for tunneling to {worker_ip}")
+            async with asyncssh.connect(**bastion_kwargs) as bastion_conn:
+                target_kwargs = connect_kwargs.copy()
+                target_kwargs["tunnel"] = bastion_conn
+                async with asyncssh.connect(**target_kwargs) as conn:
+                    await _run_commands_on_conn(conn, worker_ip, commands, results)
+        else:
+            async with asyncssh.connect(**connect_kwargs) as conn:
+                await _run_commands_on_conn(conn, worker_ip, commands, results)
 
     except Exception as e:
         logger.error(f"SSH connection to {worker_ip} failed: {e}")
         results.append(CommandResult(
             commands[len(results)] if len(results) < len(commands) else "connection",
-            stderr=f"SSH connection failed: {str(e)}",
-            exit_code=255,
+            stderr=str(e),
+            exit_code=1
         ))
 
     return results
+
+
+async def _run_commands_on_conn(conn, worker_ip: str, commands: List[str], results: List[CommandResult]):
+    """Ejecuta la lista de comandos en una conexión activa."""
+    for cmd in commands:
+        logger.info(f"[{worker_ip}] $ {cmd}")
+        try:
+            result = await asyncio.wait_for(
+                conn.run(cmd, check=False),
+                timeout=SSH_TIMEOUT
+            )
+            cr = CommandResult(
+                command=cmd,
+                stdout=result.stdout.strip() if result.stdout else "",
+                stderr=result.stderr.strip() if result.stderr else "",
+                exit_code=result.exit_status or 0,
+            )
+            results.append(cr)
+
+            if cr.exit_code != 0:
+                logger.warning(f"[{worker_ip}] Command failed (exit={cr.exit_code}): {cmd}")
+                logger.warning(f"  stderr: {cr.stderr[:200]}")
+                break  # Detener ante fallo
+
+        except asyncio.TimeoutError:
+            results.append(CommandResult(cmd, stderr="Timeout", exit_code=124))
+            break
 
 
 async def _mock_execute(commands: List[str]) -> List[CommandResult]:

@@ -16,34 +16,20 @@ class Network(Base):
     id = Column(Integer, primary_key=True)
     slice_id = Column(Integer, ForeignKey("slices.id"))
     vlan_inner = Column(Integer)
-    subnet_cidr = Column(String(18))
     is_remote = Column(Boolean)
-    internet_access = Column(Boolean)
 
 class VmInterface(Base):
     __tablename__ = "vm_interfaces"
     id = Column(Integer, primary_key=True)
     vm_id = Column(Integer, ForeignKey("virtual_machines.id"))
-    network_id = Column(Integer, ForeignKey("networks.id"))
+    network_id = Column(Integer, ForeignKey("networks.id"), nullable=True)
     mac_address = Column(String(17))
-    ip_address = Column(String(15))
     interface_name = Column(String(20))
     tap_name = Column(String(30))
+    bridge_name = Column(String(30), nullable=True)
 
 class VirtualMachine(Base):
     __tablename__ = "virtual_machines"
     id = Column(Integer, primary_key=True)
     slice_id = Column(Integer, ForeignKey("slices.id"))
     worker_id = Column(Integer)
-
-class SecurityRule(Base):
-    __tablename__ = "security_rules"
-    id = Column(Integer, primary_key=True)
-    slice_id = Column(Integer, ForeignKey("slices.id"))
-    src_vm_id = Column(Integer, ForeignKey("virtual_machines.id"))
-    dst_vm_id = Column(Integer, ForeignKey("virtual_machines.id"))
-    protocol = Column(String(10))
-    port_min = Column(Integer, nullable=True)
-    port_max = Column(Integer, nullable=True)
-    action = Column(String(10))
-    priority = Column(Integer)
