@@ -305,7 +305,7 @@ async def get_slice(
     if user.role == "STUDENT" and slice_obj.user_id != user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
         
-    if user.role == "SLICE_ADMIN":
+    if user.role == "SLICE_ADMIN" and slice_obj.user_id != user.id:
         student_res = await db.execute(select(models.User).where(models.User.id == slice_obj.user_id))
         student = student_res.scalar_one_or_none()
         if not student or student.admin_id != user.id:
