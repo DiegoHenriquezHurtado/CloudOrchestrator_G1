@@ -143,6 +143,35 @@ async def get_flavor(flavor_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"message": "Error al consultar flavor en OpenStack", "error": str(e)}
         )
+import asyncio
+
+@app.get("/v1/vms/{server_id}/vnc", summary="Obtener consola VNC fresca")
+async def get_vnc_console(server_id: str):
+    """Genera y retorna una URL de consola VNC fresca desde Nova"""
+    try:
+        loop = asyncio.get_running_loop()
+        admin_token = await loop.run_in_executor(
+            None,
+            orchestrator.client.get_admin_token,
+            orchestrator.settings.DOMAIN_ID,
+            orchestrator.settings.ADMIN_PROJECT_ID,
+            orchestrator.settings.ADMIN_USER_ID,
+            orchestrator.settings.ADMIN_USER_PASSWORD
+        )
+        vnc_url = await loop.run_in_executor(
+            None,
+            orchestrator.client.get_vnc_console,
+            admin_token,
+            server_id
+        )
+        return {"vnc_url": vnc_url}
+    except Exception as e:
+        logger.error(f"Error obteniendo consola VNC para {server_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Error al obtener consola VNC", "error": str(e)}
+        )
+
 
 
 if __name__ == "__main__":

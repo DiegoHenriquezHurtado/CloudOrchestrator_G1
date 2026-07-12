@@ -312,28 +312,39 @@ async def get_slice(
             raise HTTPException(status_code=403, detail="Not authorized")
 
     vms = []
-    for vm in slice_obj.vms:
-        interfaces = []
-        for iface in vm.interfaces:
-            net_res = await db.execute(select(models.Network).where(models.Network.id == iface.network_id))
-            net = net_res.scalar_one_or_none()
-            interfaces.append(schemas.VmInterfaceDetail(
-                interface_name=iface.interface_name,
-                tap_name=iface.tap_name,
-                vlan_inner=net.vlan_inner if net else 0,
-                bridge_name=iface.bridge_name or (f"br-sl-{slice_obj.id}" if net else "br-inet")
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for vm in slice_obj.vms:
+            interfaces = []
+            for iface in vm.interfaces:
+                net_res = await db.execute(select(models.Network).where(models.Network.id == iface.network_id))
+                net = net_res.scalar_one_or_none()
+                interfaces.append(schemas.VmInterfaceDetail(
+                    interface_name=iface.interface_name,
+                    tap_name=iface.tap_name,
+                    vlan_inner=net.vlan_inner if net else 0,
+                    bridge_name=iface.bridge_name or (f"br-sl-{slice_obj.id}" if net else "br-inet")
+                ))
+                
+            vnc_url = vm.vnc_url
+            if slice_obj.iaas_target == "openstack" and vm.instance_path:
+                try:
+                    OPENSTACK_DRIVER_URL = os.getenv("OPENSTACK_DRIVER_URL", "http://openstack-driver:8089")
+                    res = await client.get(f"{OPENSTACK_DRIVER_URL}/v1/vms/{vm.instance_path}/vnc")
+                    if res.status_code == 200:
+                        vnc_url = res.json().get("vnc_url", vm.vnc_url)
+                except Exception:
+                    pass
+                
+            vms.append(schemas.VMDetail(
+                id=vm.id,
+                name=vm.name,
+                worker_id=vm.worker_id,
+                status=vm.status,
+                process_id=vm.process_id,
+                vnc_port=vm.vnc_port,
+                vnc_url=vnc_url,
+                interfaces=interfaces
             ))
-            
-        vms.append(schemas.VMDetail(
-            id=vm.id,
-            name=vm.name,
-            worker_id=vm.worker_id,
-            status=vm.status,
-            process_id=vm.process_id,
-            vnc_port=vm.vnc_port,
-            vnc_url=vm.vnc_url,
-            interfaces=interfaces
-        ))
 
     return schemas.SliceDetailResponse(
         id=slice_obj.id,
