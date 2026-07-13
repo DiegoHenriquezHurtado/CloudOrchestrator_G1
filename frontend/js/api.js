@@ -30,6 +30,35 @@ async function api(method, path, body = null) {
   return data;
 }
 
+// Sube un FormData (ej. carga de archivos) reportando progreso vía XHR,
+// ya que fetch no expone eventos de progreso de subida.
+function apiUpload(method, path, formData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, `${API}${path}`);
+    if (state.token) xhr.setRequestHeader('Authorization', `Bearer ${state.token}`);
+
+    xhr.upload.addEventListener('progress', e => {
+      if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
+    });
+
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data);
+      } else {
+        const detail = typeof data.detail === 'string'
+          ? data.detail
+          : JSON.stringify(data.detail || `Error ${xhr.status}`);
+        reject(new Error(detail));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Error de red al subir el archivo'));
+    xhr.send(formData);
+  });
+}
+
 // ── Auth ──────────────────────────────────────────────────────
 async function login(username, password) {
   const data = await api('POST', '/auth/login', { username, password });

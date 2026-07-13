@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import decode_token
-from app.proxy import forward_request
+from app.proxy import forward_request, stream_request
 from app.routes import ROUTE_MAP, ROLE_RULES
 from app.config import MAX_BODY_SIZE
 
@@ -33,21 +33,26 @@ async def gateway(service: str, path: str, request: Request):
     if service not in ROUTE_MAP:
         raise HTTPException(status_code=404, detail="Servicio no encontrado")
 
-    body = await request.body()
+    # Los uploads de archivos (ej. imágenes de disco) van en multipart/form-data
+    # y pueden pesar varios GB: se reenvían en streaming, sin cargarlos en
+    # memoria completos ni aplicar el límite de payload pensado para JSON.
+    content_type = request.headers.get("content-type", "")
+    is_streamed_upload = content_type.startswith("multipart/form-data")
 
-    if len(body) > MAX_BODY_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="Payload excede 2MB"
-        )
+    body = None
+    if not is_streamed_upload:
+        body = await request.body()
+        if len(body) > MAX_BODY_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="Payload excede 2MB"
+            )
 
     if service == "auth":
-        return await forward_request(
-            request.method,
-            f"{ROUTE_MAP[service]}/{path}",
-            dict(request.headers),
-            body
-        )
+        target_url = f"{ROUTE_MAP[service]}/{path}"
+        if is_streamed_upload:
+            return await stream_request(request.method, target_url, dict(request.headers), request)
+        return await forward_request(request.method, target_url, dict(request.headers), body)
 
     auth_header = request.headers.get("Authorization")
 
@@ -68,6 +73,9 @@ async def gateway(service: str, path: str, request: Request):
     headers["X-User-Role"] = user_role
 
     target_url = f"{ROUTE_MAP[service]}/{path}"
+
+    if is_streamed_upload:
+        return await stream_request(request.method, target_url, headers, request)
 
     return await forward_request(
         request.method,

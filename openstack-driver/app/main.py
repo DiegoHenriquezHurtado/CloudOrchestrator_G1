@@ -6,7 +6,7 @@ e interactúa con el plano de control del clúster OpenStack.
 """
 
 import logging
-from fastapi import FastAPI, status, HTTPException
+from fastapi import FastAPI, status, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 
 from app.schemas import (
@@ -154,6 +154,57 @@ async def list_images():
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"message": "Error al listar imágenes en OpenStack", "error": str(e)}
+        )
+
+
+@app.post(
+    "/v1/images",
+    status_code=status.HTTP_201_CREATED,
+    summary="Cargar e importar una imagen de disco en Glance (independiente de la plataforma de origen)"
+)
+async def upload_image(
+    name: str = Form(...),
+    file: UploadFile = File(...),
+    disk_format: str = Form("qcow2"),
+    container_format: str = Form("bare"),
+    visibility: str = Form("public"),
+):
+    """
+    Recibe un archivo de imagen (.img/.qcow2) vía multipart/form-data y lo
+    registra públicamente en Glance con el formato de disco indicado (QCOW2 por defecto).
+    """
+    if not file.filename or not file.filename.lower().endswith((".img", ".qcow2")):
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos con extensión .img o .qcow2")
+
+    try:
+        result = await orchestrator.upload_image(name, disk_format, container_format, visibility, file)
+        logger.info(f"Imagen '{name}' registrada y cargada en Glance con ID {result['id']}")
+        return result
+    except Exception as e:
+        logger.error(f"Error subiendo la imagen '{name}': {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Error al subir la imagen a OpenStack Glance", "error": str(e)}
+        )
+    finally:
+        await file.close()
+
+
+@app.delete(
+    "/v1/images/{image_id}",
+    summary="Eliminar una imagen de Glance (borrado seguro tras validación)"
+)
+async def delete_image(image_id: str):
+    """Elimina la imagen indicada del servicio Glance."""
+    try:
+        await orchestrator.delete_image(image_id)
+        logger.info(f"Imagen {image_id} eliminada de Glance")
+        return {"id": image_id, "status": "DELETED"}
+    except Exception as e:
+        logger.error(f"Error eliminando la imagen {image_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Error al eliminar la imagen en OpenStack Glance", "error": str(e)}
         )
 
 

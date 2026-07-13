@@ -86,6 +86,52 @@ class OpenStackOrchestrator:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.client.list_images, admin_token)
 
+    async def upload_image(self, name: str, disk_format: str, container_format: str, visibility: str, upload_file) -> dict:
+        """
+        Registra e importa una imagen de disco en Glance de forma independiente
+        de la plataforma que la generó (Linux/QEMU, OpenStack, etc).
+
+        Primero registra los metadatos y luego transmite el archivo en streaming
+        (sin cargarlo completo en memoria) hacia Glance. Si la subida de datos
+        falla, se elimina el registro de metadatos huérfano.
+        """
+        loop = asyncio.get_running_loop()
+        admin_token = await self._get_admin_token()
+
+        image_id = await loop.run_in_executor(
+            None,
+            self.client.create_image,
+            admin_token,
+            name,
+            disk_format,
+            container_format,
+            visibility
+        )
+
+        try:
+            await loop.run_in_executor(
+                None,
+                self.client.upload_image_data,
+                admin_token,
+                image_id,
+                upload_file.file
+            )
+        except Exception as e:
+            logger.error(f"Fallo subiendo datos de la imagen '{name}' ({image_id}), limpiando registro huérfano: {e}")
+            try:
+                await loop.run_in_executor(None, self.client.delete_image, admin_token, image_id)
+            except Exception as cleanup_err:
+                logger.error(f"No se pudo limpiar la imagen huérfana {image_id}: {cleanup_err}")
+            raise
+
+        return {"id": image_id, "name": name, "status": "uploaded"}
+
+    async def delete_image(self, image_id: str) -> None:
+        """Elimina una imagen de Glance (borrado seguro tras validación)"""
+        admin_token = await self._get_admin_token()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.client.delete_image, admin_token, image_id)
+
     async def provision_slice(self, req: CreateSliceRequest) -> CreateSliceResponse:
         """
         Orquesta de forma atómica la creación de un Slice en OpenStack.

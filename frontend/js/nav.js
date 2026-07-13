@@ -55,7 +55,7 @@ function navigate(viewId) {
     'pending':    'Solicitudes Pendientes',
     'all-slices': 'Todos los Slices',
     'infra':      'Infraestructura',
-    'images':     'Imágenes Base',
+    'images':     'Gestión de Imágenes de Sistema',
     'networking': 'Redes & VLANs',
     'users':      'Gestión de Usuarios',
   };

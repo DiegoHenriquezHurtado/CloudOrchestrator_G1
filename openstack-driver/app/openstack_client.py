@@ -46,6 +46,9 @@ class OpenStackClient:
             {"id": "img-cirros-uuid", "name": "cirros-0.6.2", "status": "active", "size": 16300000},
             {"id": "img-ubuntu-uuid", "name": "ubuntu-22.04", "status": "active", "size": 700000000},
         ]
+        self.create_image = lambda token, name, disk_format, container_format, visibility: f"img-{name}-uuid"
+        self.upload_image_data = lambda token, image_id, file_obj: None
+        self.delete_image = lambda *args, **kwargs: None
 
     def _check(self, response: requests.Response, expected_status: int, op_name: str):
         if response.status_code != expected_status:
@@ -362,3 +365,40 @@ class OpenStackClient:
         res = requests.get(url, headers=headers, timeout=15)
         self._check(res, 200, "list_images")
         return res.json().get("images", [])
+
+    def create_image(self, token: str, name: str, disk_format: str, container_format: str, visibility: str) -> str:
+        """Registra los metadatos de una nueva imagen en Glance (aún sin datos binarios)."""
+        url = f"{self.glance_url}/images"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Auth-Token": token
+        }
+        data = {
+            "name": name,
+            "disk_format": disk_format,
+            "container_format": container_format,
+            "visibility": visibility
+        }
+        res = requests.post(url, json=data, headers=headers, timeout=15)
+        self._check(res, 201, "create_image")
+        return res.json()["id"]
+
+    def upload_image_data(self, token: str, image_id: str, file_obj) -> None:
+        """Sube el contenido binario del disco a una imagen ya registrada en Glance.
+
+        `file_obj` es un objeto file-like (streameado por `requests`, no se
+        carga completo en memoria) apuntando al inicio del archivo.
+        """
+        url = f"{self.glance_url}/images/{image_id}/file"
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "X-Auth-Token": token
+        }
+        res = requests.put(url, data=file_obj, headers=headers, timeout=3600)
+        self._check(res, 204, "upload_image_data")
+
+    def delete_image(self, token: str, image_id: str) -> None:
+        url = f"{self.glance_url}/images/{image_id}"
+        headers = {"X-Auth-Token": token}
+        res = requests.delete(url, headers=headers, timeout=15)
+        self._check(res, 204, "delete_image")
