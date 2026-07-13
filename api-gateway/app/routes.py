@@ -7,7 +7,8 @@ ROUTE_MAP = {
     "images": IMAGE_MANAGER_URL + "/images",
     "infra": MONITORING_URL + "/monitoring",
     "networking": NETWORKING_URL + "/networking",
-    "placement": PLACEMENT_URL + "/placement"
+    "placement": PLACEMENT_URL + "/placement",
+    "openstack": OPENSTACK_DRIVER_URL + "/v1"
 }
 
 ROLE_RULES = {
@@ -17,5 +18,6 @@ ROLE_RULES = {
     "images": ["STUDENT", "SLICE_ADMIN", "SYSTEM_ADMIN"],
     "infra": ["SYSTEM_ADMIN"],
     "networking": ["SYSTEM_ADMIN"],
-    "placement": ["SYSTEM_ADMIN"]
+    "placement": ["SYSTEM_ADMIN"],
+    "openstack": ["SLICE_ADMIN", "SYSTEM_ADMIN"]
 }

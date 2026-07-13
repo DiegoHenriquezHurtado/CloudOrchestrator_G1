@@ -61,6 +61,7 @@ CREATE TABLE virtual_machines (
     vcpu INT NOT NULL, -- Cores asignados
     disk INT, -- Disco asignado
     flavor VARCHAR(100), -- Sabor en OpenStack (Fase 2)
+    flavor_id INT REFERENCES flavors(id), -- Flavor Linux original (para exportar/reimportar la topología fielmente)
     worker_id INT REFERENCES workers(id),
     process_id INT, -- PID reportado por el Driver
     vnc_port INT,   -- Puerto VNC reportado

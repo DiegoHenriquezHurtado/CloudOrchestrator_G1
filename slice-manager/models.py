@@ -53,6 +53,7 @@ class VirtualMachine(Base):
     vcpu = Column(Integer, nullable=False)
     disk = Column(Integer, nullable=True)
     flavor = Column(String(100), nullable=True)
+    flavor_id = Column(Integer, ForeignKey("flavors.id"), nullable=True)
     worker_id = Column(Integer)
     process_id = Column(Integer)
     vnc_port = Column(Integer)

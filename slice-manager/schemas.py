@@ -62,6 +62,7 @@ class SliceListResponseItem(BaseModel):
     id: int
     name: str
     status: str
+    iaas_target: str
     vms_count: int
     created_at: datetime
 

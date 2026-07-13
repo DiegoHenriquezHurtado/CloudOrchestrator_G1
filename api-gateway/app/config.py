@@ -6,6 +6,7 @@ IMAGE_MANAGER_URL = os.getenv("IMAGE_MANAGER_URL", "http://image-manager:8083")
 MONITORING_URL = os.getenv("MONITORING_URL", "http://monitoring:8084")
 NETWORKING_URL = os.getenv("NETWORKING_URL", "http://networking:8085")
 PLACEMENT_URL = os.getenv("PLACEMENT_URL", "http://vm-placement:8086")
+OPENSTACK_DRIVER_URL = os.getenv("OPENSTACK_DRIVER_URL", "http://openstack-driver:8089")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "supersecretkey_orchestrator")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")

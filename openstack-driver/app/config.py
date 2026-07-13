@@ -32,6 +32,6 @@ class Settings(BaseSettings):
 
     @property
     def glance_url(self) -> str:
-        return f"http://{self.ACCESS_NODE_IP}:{self.GLANCE_PORT}/v2.0"
+        return f"http://{self.ACCESS_NODE_IP}:{self.GLANCE_PORT}/v2"
 
 settings = Settings()

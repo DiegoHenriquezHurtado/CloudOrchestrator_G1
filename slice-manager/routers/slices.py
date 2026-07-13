@@ -27,11 +27,356 @@ async def get_current_user(x_user_role: str = Header(...), x_user_id: int = Head
     return user
 
 # ---------------------------------------------------------------------------
-# POST /slices/ — Crear solicitud (STUDENT)
+# Activa un slice "linux" ya persistido: crea tareas CREATE_VM, invoca
+# VM Placement y Networking, y enriquece los payloads. Deja el slice ACTIVE.
+# Reutilizado por /approve (flujo STUDENT, PENDING_APPROVAL -> ACTIVE) y por
+# /deploy (flujo SLICE_ADMIN/SYSTEM_ADMIN, DRAFT -> ACTIVE bajo demanda).
 # ---------------------------------------------------------------------------
-# Flujo: Validar imágenes → Insertar slice + VMs en PENDING_APPROVAL
-#        → Guardar topología (links) como JSON para la fase de aprobación.
-#        NO se llama a Networking aquí (se hará tras el Placement en approve).
+async def _activate_linux_slice(slice_obj: models.Slice, db: AsyncSession):
+    tasks_created = 0
+    for vm in slice_obj.vms:
+        vm.status = "PENDING"
+        task = models.Task(
+            slice_id=slice_obj.id,
+            vm_id=vm.id,
+            task_type="CREATE_VM",
+            status="PENDING",
+            payload={
+                "vm": {
+                    "id": vm.id,
+                    "name": vm.name,
+                    "base_image": vm.base_image,
+                    "ram": vm.ram,
+                    "vcpu": vm.vcpu,
+                    "disk": vm.disk,
+                    "instance_path": ""
+                },
+                "slice": {
+                    "id": slice_obj.id,
+                    "vlan_slice": 0
+                },
+                "interfaces": []
+            }
+        )
+        db.add(task)
+        tasks_created += 1
+
+    # Commit para que VM Placement pueda ver las tareas PENDING
+    await db.commit()
+
+    placement_success = False
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            res = await client.post(f"{PLACEMENT_URL}/placement/trigger")
+            if res.status_code == 200:
+                placement_success = True
+        except httpx.RequestError:
+            pass  # Si Placement no responde, las tareas quedan en PENDING para el loop
+
+    await db.refresh(slice_obj)
+    vm_result = await db.execute(
+        select(models.VirtualMachine).where(models.VirtualMachine.slice_id == slice_obj.id)
+    )
+    vms_updated = vm_result.scalars().all()
+
+    placement_map = {}
+    all_placed = True
+    for vm in vms_updated:
+        if vm.worker_id:
+            placement_map[str(vm.id)] = vm.worker_id
+        else:
+            placement_map[str(vm.id)] = 0
+            all_placed = False
+
+    networking_response = None
+    topology_links = slice_obj.topology or []
+
+    if topology_links:
+        vm_name_to_id = {vm.name: vm.id for vm in vms_updated}
+        networking_links = []
+        for i, link in enumerate(topology_links):
+            vm_a_name = str(link.get("vm_a", "")).upper()
+            vm_b_name = str(link.get("vm_b", "")).upper()
+            vm_a_id = 0 if vm_a_name in ("INTERNET", "INET", "WAN", "EXTERNAL") else vm_name_to_id.get(link.get("vm_a"))
+            vm_b_id = 0 if vm_b_name in ("INTERNET", "INET", "WAN", "EXTERNAL") else vm_name_to_id.get(link.get("vm_b"))
+            if vm_a_id is not None and vm_b_id is not None:
+                networking_links.append({
+                    "link_name": f"link_{i}",
+                    "vm_a_id": vm_a_id,
+                    "iface_a": link.get("iface_a", "eth0"),
+                    "vm_b_id": vm_b_id,
+                    "iface_b": link.get("iface_b", "eth0")
+                })
+
+        networking_payload = {
+            "slice_id": slice_obj.id,
+            "placement_map": placement_map,
+            "links": networking_links
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                res = await client.post(f"{NETWORKING_URL}/networking/allocate", json=networking_payload)
+                if res.status_code == 200:
+                    networking_response = res.json()
+            except httpx.RequestError:
+                pass  # Networking se puede invocar después vía Dispatcher
+
+    vlan_slice = None
+    bridge_name = None
+    if networking_response:
+        vlan_slice = networking_response.get("vlan_slice")
+        bridge_name = networking_response.get("bridge_name")
+        slice_obj.vlan_slice = vlan_slice
+
+    tasks_res = await db.execute(
+        select(models.Task).where(
+            models.Task.slice_id == slice_obj.id,
+            models.Task.task_type == "CREATE_VM"
+        )
+    )
+    tasks = tasks_res.scalars().all()
+
+    for task in tasks:
+        vm = next((v for v in vms_updated if v.id == task.vm_id), None)
+        if not vm:
+            continue
+
+        ifaces_res = await db.execute(
+            select(models.VmInterface).where(models.VmInterface.vm_id == vm.id)
+        )
+        ifaces = ifaces_res.scalars().all()
+
+        interfaces_payload = []
+        for iface in ifaces:
+            net_res = await db.execute(
+                select(models.Network).where(models.Network.id == iface.network_id)
+            )
+            net = net_res.scalar_one_or_none()
+            interfaces_payload.append({
+                "interface_name": iface.interface_name,
+                "tap_name": iface.tap_name,
+                "vlan_inner": net.vlan_inner if net else 0,
+                "mac_address": iface.mac_address,
+                "bridge_name": iface.bridge_name or (f"br-sl-{slice_obj.id}" if net else "br-inet"),
+                "network_id": iface.network_id,
+                "is_remote": net.is_remote if net else False
+            })
+
+        instance_path = f"/mnt/storage/instances/{vm.id}.qcow2"
+        vm.instance_path = instance_path
+
+        task.payload = {
+            "vm_name": vm.name,
+            "base_image": vm.base_image,
+            "base_path": f"/mnt/storage/base/{vm.base_image}",
+            "instance_path": instance_path,
+            "ram": vm.ram,
+            "vcpu": vm.vcpu,
+            "disk": vm.disk,
+            "slice_id": slice_obj.id,
+            "vlan_slice": vlan_slice,
+            "bridge_name": bridge_name or f"br-sl-{slice_obj.id}",
+            "interfaces": interfaces_payload
+        }
+
+    slice_obj.status = "ACTIVE"
+    await db.commit()
+
+    msg_parts = [f"{tasks_created} tareas de tipo CREATE_VM generadas."]
+    if placement_success and all_placed:
+        msg_parts.append("Placement completado.")
+    elif not placement_success:
+        msg_parts.append("Placement pendiente (servicio no disponible, las tareas serán procesadas por el loop).")
+    if networking_response:
+        msg_parts.append(f"Networking asignado (Vlan-Slice: {vlan_slice}).")
+    else:
+        msg_parts.append("Networking pendiente (será asignado por el Dispatcher).")
+
+    return tasks_created, " ".join(msg_parts)
+
+# ---------------------------------------------------------------------------
+# Activa un slice "openstack" ya persistido: reconstruye el payload de VMs/
+# redes desde la topología guardada, crea tareas CREATE_VM en PENDING (el
+# mismo estado que vm-placement espera para asignarles worker) e invoca
+# VM Placement. Deja el slice ACTIVE.
+# Reutilizado por /deploy (flujo SLICE_ADMIN/SYSTEM_ADMIN, borrador -> activo)
+# y por /approve para mantener un único punto de esta lógica.
+# ---------------------------------------------------------------------------
+async def _activate_openstack_slice(slice_obj: models.Slice, db: AsyncSession):
+    topology = slice_obj.topology or {}
+    links = topology.get("links", [])
+    networks_in = topology.get("networks", [])
+
+    networks_payload = []
+    for net in networks_in:
+        networks_payload.append({
+            "name": net.get("name"),
+            "cidr": net.get("cidr"),
+            "is_provider": net.get("is_provider", False)
+        })
+
+    private_links = []
+    for link in links:
+        vm_a = link.get("vm_a", "")
+        vm_b = link.get("vm_b", "")
+        is_a_provider = vm_a.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
+        is_b_provider = vm_b.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
+        if not is_a_provider and not is_b_provider:
+            private_links.append(link)
+
+    private_networks = [n for n in networks_payload if not n["is_provider"]]
+    link_net_map = {}
+    for idx, link in enumerate(private_links):
+        if idx < len(private_networks):
+            link_net_map[idx] = private_networks[idx]["name"]
+
+    vm_vms_payload = []
+    for vm in slice_obj.vms:
+        vm_networks = []
+        for link in links:
+            vm_a = link.get("vm_a", "")
+            vm_b = link.get("vm_b", "")
+            is_a_provider = vm_a.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
+            is_b_provider = vm_b.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
+
+            if vm_a == vm.name:
+                if is_b_provider:
+                    vm_networks.append(vm_b)
+                else:
+                    try:
+                        l_idx = private_links.index(link)
+                        net_name = link_net_map.get(l_idx)
+                        if net_name:
+                            vm_networks.append(net_name)
+                    except ValueError:
+                        pass
+            elif vm_b == vm.name:
+                if is_a_provider:
+                    vm_networks.append(vm_a)
+                else:
+                    try:
+                        l_idx = private_links.index(link)
+                        net_name = link_net_map.get(l_idx)
+                        if net_name:
+                            vm_networks.append(net_name)
+                    except ValueError:
+                        pass
+
+        # Remove duplicates preserving order, and sort so that provider/external networks always come first (map to eth0)
+        unique_networks = list(dict.fromkeys(vm_networks))
+        unique_networks.sort(key=lambda net: 0 if net.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"] else 1)
+            
+        vm_vms_payload.append({
+            "name": vm.name,
+            "image": vm.base_image,
+            "flavor": vm.flavor,
+            "networks": unique_networks
+        })
+
+    task_payload = {
+        "slice_id": slice_obj.name,
+        "vms": vm_vms_payload,
+        "networks": networks_payload
+    }
+
+    tasks_created = 0
+    for vm in slice_obj.vms:
+        vm.status = "PENDING"
+        task = models.Task(
+            slice_id=slice_obj.id,
+            vm_id=vm.id,
+            task_type="CREATE_VM",
+            status="PENDING",
+            payload=task_payload
+        )
+        db.add(task)
+        tasks_created += 1
+
+    slice_obj.status = "ACTIVE"
+    await db.commit()
+
+    placement_message = "Placement pendiente (servicio no disponible, las tareas serán procesadas por el loop)."
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            res = await client.post(f"{PLACEMENT_URL}/placement/trigger")
+            if res.status_code == 200:
+                placement_message = "Placement completado."
+        except httpx.RequestError:
+            pass
+
+    return tasks_created, f"{tasks_created} tareas de tipo CREATE_VM generadas. {placement_message}"
+
+# ---------------------------------------------------------------------------
+# Valida flavor/imagen y crea las filas VirtualMachine de un slice (linux u
+# openstack). Reutilizado por create_slice y por update_slice (edición de
+# un Borrador, donde primero se borran las VMs previas y se reconstruyen).
+# ---------------------------------------------------------------------------
+async def _build_vms(slice_in: schemas.SliceCreate, user: models.User, slice_id: int, vm_status: str, db: AsyncSession):
+    vm_records = {}
+    async with httpx.AsyncClient() as client:
+        for vm in slice_in.vms:
+            ram = 0
+            vcpu = 0
+            disk = 0
+            flavor_str = vm.flavor
+
+            if slice_in.iaas_target == "linux":
+                if not vm.flavor_id:
+                    raise HTTPException(status_code=400, detail=f"flavor_id is required for linux VM {vm.name}")
+                flavor_res = await db.execute(select(models.Flavor).where(models.Flavor.id == vm.flavor_id))
+                flavor_obj = flavor_res.scalar_one_or_none()
+                if not flavor_obj:
+                    raise HTTPException(status_code=400, detail=f"Flavor ID {vm.flavor_id} not found")
+                if user.role == "STUDENT" and flavor_obj.allowed_role != "STUDENT":
+                    raise HTTPException(status_code=403, detail=f"Student cannot use flavor {flavor_obj.name}")
+
+                ram = flavor_obj.ram
+                vcpu = flavor_obj.vcpu
+                disk = flavor_obj.disk
+
+            elif slice_in.iaas_target == "openstack":
+                if not vm.flavor:
+                    raise HTTPException(status_code=400, detail=f"flavor (string) is required for openstack VM {vm.name}")
+
+                # Dynamic fetch from Nova API
+                OPENSTACK_DRIVER_URL = os.getenv("OPENSTACK_DRIVER_URL", "http://openstack-driver:8089")
+                try:
+                    os_res = await client.get(f"{OPENSTACK_DRIVER_URL}/v1/flavors/{vm.flavor}")
+                    if os_res.status_code == 200:
+                        os_flavor = os_res.json()
+                        ram = os_flavor.get("ram", 0)
+                        vcpu = os_flavor.get("vcpus", 0)
+                        disk = os_flavor.get("disk", 0)
+                    else:
+                        raise HTTPException(status_code=400, detail=f"OpenStack flavor {vm.flavor} not found or error")
+                except httpx.RequestError:
+                    raise HTTPException(status_code=503, detail="OpenStack Driver unavailable")
+
+            new_vm = models.VirtualMachine(
+                slice_id=slice_id,
+                name=vm.name,
+                base_image=vm.base_image,
+                ram=ram,
+                vcpu=vcpu,
+                disk=disk,
+                flavor=flavor_str,
+                flavor_id=vm.flavor_id,
+                status=vm_status
+            )
+            db.add(new_vm)
+            await db.flush()
+            vm_records[vm.name] = new_vm
+    return vm_records
+
+# ---------------------------------------------------------------------------
+# POST /slices/ — Crear slice (STUDENT: solicitud; SLICE_ADMIN/SYSTEM_ADMIN: borrador)
+# ---------------------------------------------------------------------------
+# Flujo: Validar imágenes → Insertar slice + VMs.
+#        STUDENT: queda en PENDING_APPROVAL (requiere aprobación de SLICE_ADMIN).
+#        SLICE_ADMIN/SYSTEM_ADMIN (linux u openstack): queda en DRAFT (Borrador).
+#        No se invoca Placement/Networking/OpenStack aquí — eso ocurre recién
+#        con POST /{id}/deploy, bajo demanda.
 # ---------------------------------------------------------------------------
 @router.post("/", response_model=schemas.SliceCreateResponse, status_code=201)
 async def create_slice(
@@ -66,7 +411,10 @@ async def create_slice(
     else:
         topology_data = [link.model_dump() for link in slice_in.links]
 
-    slice_status = "ACTIVE" if slice_in.iaas_target == "openstack" else "PENDING_APPROVAL"
+    # SLICE_ADMIN/SYSTEM_ADMIN: el slice queda como Borrador (DRAFT) hasta que se despliegue
+    # explícitamente vía POST /{id}/deploy. STUDENT: sigue el flujo de aprobación existente.
+    is_admin = user.role in ["SLICE_ADMIN", "SYSTEM_ADMIN"]
+    slice_status = "DRAFT" if is_admin else "PENDING_APPROVAL"
     new_slice = models.Slice(
         user_id=user.id,
         name=slice_in.name,
@@ -77,164 +425,15 @@ async def create_slice(
     db.add(new_slice)
     await db.flush()
 
-    vm_records = {}
-    async with httpx.AsyncClient() as client:
-        for vm in slice_in.vms:
-            vm_status = "PENDING" if slice_in.iaas_target == "openstack" else "PENDING_APPROVAL"
-            
-            ram = 0
-            vcpu = 0
-            disk = 0
-            flavor_str = vm.flavor
-            
-            if slice_in.iaas_target == "linux":
-                if not vm.flavor_id:
-                    raise HTTPException(status_code=400, detail=f"flavor_id is required for linux VM {vm.name}")
-                flavor_res = await db.execute(select(models.Flavor).where(models.Flavor.id == vm.flavor_id))
-                flavor_obj = flavor_res.scalar_one_or_none()
-                if not flavor_obj:
-                    raise HTTPException(status_code=400, detail=f"Flavor ID {vm.flavor_id} not found")
-                if user.role == "STUDENT" and flavor_obj.allowed_role != "STUDENT":
-                    raise HTTPException(status_code=403, detail=f"Student cannot use flavor {flavor_obj.name}")
-                
-                ram = flavor_obj.ram
-                vcpu = flavor_obj.vcpu
-                disk = flavor_obj.disk
-                
-            elif slice_in.iaas_target == "openstack":
-                if not vm.flavor:
-                    raise HTTPException(status_code=400, detail=f"flavor (string) is required for openstack VM {vm.name}")
-                
-                # Dynamic fetch from Nova API
-                OPENSTACK_DRIVER_URL = os.getenv("OPENSTACK_DRIVER_URL", "http://openstack-driver:8089")
-                try:
-                    os_res = await client.get(f"{OPENSTACK_DRIVER_URL}/v1/flavors/{vm.flavor}")
-                    if os_res.status_code == 200:
-                        os_flavor = os_res.json()
-                        ram = os_flavor.get("ram", 0)
-                        vcpu = os_flavor.get("vcpus", 0)
-                        disk = os_flavor.get("disk", 0)
-                    else:
-                        raise HTTPException(status_code=400, detail=f"OpenStack flavor {vm.flavor} not found or error")
-                except httpx.RequestError:
-                    raise HTTPException(status_code=503, detail="OpenStack Driver unavailable")
-            
-            new_vm = models.VirtualMachine(
-                slice_id=new_slice.id,
-                name=vm.name,
-                base_image=vm.base_image,
-                ram=ram,
-                vcpu=vcpu,
-                disk=disk,
-                flavor=flavor_str,
-                status=vm_status
-            )
-            db.add(new_vm)
-            await db.flush()
-            vm_records[vm.name] = new_vm
+    vm_status = "DRAFT" if is_admin else "PENDING_APPROVAL"
+    vm_records = await _build_vms(slice_in, user, new_slice.id, vm_status, db)
 
-    # Flujo directo OpenStack: insertar tareas PLACEMENT_READY
-    if slice_in.iaas_target == "openstack":
-        networks_payload = []
-        for net in slice_in.networks:
-            networks_payload.append({
-                "name": net.name,
-                "cidr": net.cidr,
-                "is_provider": net.is_provider
-            })
-            
-        private_links = []
-        for link in slice_in.links:
-            vm_a = link.vm_a
-            vm_b = link.vm_b
-            is_a_provider = vm_a.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
-            is_b_provider = vm_b.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
-            if not is_a_provider and not is_b_provider:
-                private_links.append(link)
-                
-        private_networks = [n for n in networks_payload if not n["is_provider"]]
-        link_net_map = {}
-        for idx, link in enumerate(private_links):
-            if idx < len(private_networks):
-                link_net_map[idx] = private_networks[idx]["name"]
-                
-        vm_vms_payload = []
-        for vm in slice_in.vms:
-            vm_networks = []
-            for link in slice_in.links:
-                vm_a = link.vm_a
-                vm_b = link.vm_b
-                is_a_provider = vm_a.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
-                is_b_provider = vm_b.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
-                
-                if vm_a == vm.name:
-                    if is_b_provider:
-                        vm_networks.append(vm_b)
-                    else:
-                        try:
-                            l_idx = private_links.index(link)
-                            net_name = link_net_map.get(l_idx)
-                            if net_name:
-                                vm_networks.append(net_name)
-                        except ValueError:
-                            pass
-                elif vm_b == vm.name:
-                    if is_a_provider:
-                        vm_networks.append(vm_a)
-                    else:
-                        try:
-                            l_idx = private_links.index(link)
-                            net_name = link_net_map.get(l_idx)
-                            if net_name:
-                                vm_networks.append(net_name)
-                        except ValueError:
-                            pass
-                            
-            # Remove duplicates preserving order, and sort so that provider/external networks always come first (map to eth0)
-            unique_networks = list(dict.fromkeys(vm_networks))
-            unique_networks.sort(key=lambda net: 0 if net.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"] else 1)
-            
-            vm_vms_payload.append({
-                "name": vm.name,
-                "image": vm.base_image,
-                "flavor": vm.flavor,
-                "networks": unique_networks
-            })
-            
-        task_payload = {
-            "slice_id": new_slice.name,
-            "vms": vm_vms_payload,
-            "networks": networks_payload
-        }
-        
-        for vm in slice_in.vms:
-            new_vm = vm_records[vm.name]
-            task = models.Task(
-                slice_id=new_slice.id,
-                vm_id=new_vm.id,
-                task_type="CREATE_VM",
-                status="PENDING",
-                payload=task_payload
-            )
-            db.add(task)
+    # Nota: la creación de tareas CREATE_VM y el trigger de Placement ya no
+    # ocurren aquí. Para SLICE_ADMIN/SYSTEM_ADMIN el slice queda en DRAFT y
+    # se activa explícitamente vía POST /{id}/deploy (linux u openstack).
 
     await db.commit()
     await db.refresh(new_slice)
-
-    if slice_in.iaas_target == "openstack":
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                res = await client.post(f"{PLACEMENT_URL}/placement/trigger")
-                if res.status_code != 200:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to execute VM Placement. Status: {res.status_code}"
-                    )
-            except httpx.RequestError as e:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"VM Placement service is unavailable: {str(e)}"
-                )
 
     vms_response = [
         schemas.SliceResponseVM(id=vm_records[v].id, name=vm_records[v].name, status=vm_records[v].status)
@@ -244,6 +443,87 @@ async def create_slice(
         slice_id=new_slice.id,
         name=new_slice.name,
         status=new_slice.status,
+        vms=vms_response,
+        links_count=len(slice_in.links)
+    )
+
+# ---------------------------------------------------------------------------
+# PUT /slices/{id} — Editar la topología de un Borrador (SLICE_ADMIN/SYSTEM_ADMIN)
+# ---------------------------------------------------------------------------
+# Solo permitido mientras el slice está en DRAFT. Reemplaza nombre, destino,
+# topología (links/networks) y VMs por completo: borra las VMs actuales
+# (en DRAFT no tienen interfaces/tareas reales aún) y las reconstruye con
+# _build_vms, igual que en la creación.
+# ---------------------------------------------------------------------------
+@router.put("/{id}", response_model=schemas.SliceCreateResponse)
+async def update_slice(
+    id: int,
+    slice_in: schemas.SliceCreate,
+    x_user_role: str = Header(...),
+    x_user_id: int = Header(...),
+    db: AsyncSession = Depends(get_db)
+):
+    user = await get_current_user(x_user_role, x_user_id, db)
+    if user.role not in ["SLICE_ADMIN", "SYSTEM_ADMIN"]:
+        raise HTTPException(status_code=403, detail="Only SLICE_ADMIN/SYSTEM_ADMIN can edit slices")
+
+    result = await db.execute(
+        select(models.Slice).options(selectinload(models.Slice.vms)).where(models.Slice.id == id)
+    )
+    slice_obj = result.scalar_one_or_none()
+    if not slice_obj:
+        raise HTTPException(status_code=404, detail="Slice not found")
+
+    if user.role == "SLICE_ADMIN" and slice_obj.user_id != user.id:
+        student_res = await db.execute(select(models.User).where(models.User.id == slice_obj.user_id))
+        student = student_res.scalar_one_or_none()
+        if not student or student.admin_id != user.id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+    if slice_obj.status != "DRAFT":
+        raise HTTPException(status_code=409, detail="Only slices in DRAFT state can be edited")
+
+    if slice_in.iaas_target == "linux":
+        async with httpx.AsyncClient() as client:
+            for vm in slice_in.vms:
+                try:
+                    res = await client.get(f"{IMAGE_MANAGER_URL}/images/{vm.base_image}/validate")
+                    if res.status_code != 200:
+                        raise HTTPException(status_code=400, detail=f"Image {vm.base_image} invalid or not found")
+                except httpx.RequestError:
+                    raise HTTPException(status_code=503, detail="Image Manager service unavailable")
+
+    if slice_in.iaas_target == "openstack":
+        topology_data = {
+            "links": [link.model_dump() for link in slice_in.links],
+            "networks": [net.model_dump() for net in slice_in.networks]
+        }
+    else:
+        topology_data = [link.model_dump() for link in slice_in.links]
+
+    # Reemplazo completo de VMs: en DRAFT no existen interfaces/tareas reales aún.
+    for vm in list(slice_obj.vms):
+        await db.delete(vm)
+    await db.flush()
+
+    slice_obj.name = slice_in.name
+    slice_obj.iaas_target = slice_in.iaas_target
+    slice_obj.topology = topology_data
+    await db.flush()
+
+    vm_records = await _build_vms(slice_in, user, slice_obj.id, "DRAFT", db)
+
+    await db.commit()
+    await db.refresh(slice_obj)
+
+    vms_response = [
+        schemas.SliceResponseVM(id=vm_records[v].id, name=vm_records[v].name, status=vm_records[v].status)
+        for v in vm_records
+    ]
+    return schemas.SliceCreateResponse(
+        slice_id=slice_obj.id,
+        name=slice_obj.name,
+        status=slice_obj.status,
         vms=vms_response,
         links_count=len(slice_in.links)
     )
@@ -264,6 +544,7 @@ async def list_slices(
     elif user.role == "SLICE_ADMIN":
         students_res = await db.execute(select(models.User.id).where(models.User.admin_id == user.id))
         student_ids = [row[0] for row in students_res.all()]
+        student_ids.append(user.id)
         result = await db.execute(select(models.Slice).options(selectinload(models.Slice.vms)).where(models.Slice.user_id.in_(student_ids)))
     else:
         result = await db.execute(select(models.Slice).options(selectinload(models.Slice.vms)))
@@ -276,6 +557,7 @@ async def list_slices(
             id=s.id,
             name=s.name,
             status=s.status,
+            iaas_target=s.iaas_target,
             vms_count=len(s.vms),
             created_at=s.created_at.isoformat() if s.created_at else ""
         ))
@@ -359,6 +641,102 @@ async def get_slice(
     )
 
 # ---------------------------------------------------------------------------
+# GET /slices/{id}/export — Exportar la topología lógica de un slice
+# ---------------------------------------------------------------------------
+# Devuelve exactamente la forma de schemas.SliceCreate (name, iaas_target,
+# vms, links, networks), de modo que el archivo descargado se pueda volver a
+# enviar tal cual a POST /slices/ (con un nombre distinto) para clonarlo.
+# ---------------------------------------------------------------------------
+@router.get("/{id}/export", response_model=schemas.SliceCreate)
+async def export_slice(
+    id: int,
+    x_user_role: str = Header(...),
+    x_user_id: int = Header(...),
+    db: AsyncSession = Depends(get_db)
+):
+    user = await get_current_user(x_user_role, x_user_id, db)
+    if user.role not in ["SLICE_ADMIN", "SYSTEM_ADMIN"]:
+        raise HTTPException(status_code=403, detail="Only SLICE_ADMIN/SYSTEM_ADMIN can export topologies")
+
+    result = await db.execute(
+        select(models.Slice).options(selectinload(models.Slice.vms)).where(models.Slice.id == id)
+    )
+    slice_obj = result.scalar_one_or_none()
+    if not slice_obj:
+        raise HTTPException(status_code=404, detail="Slice not found")
+
+    if user.role == "SLICE_ADMIN" and slice_obj.user_id != user.id:
+        student_res = await db.execute(select(models.User).where(models.User.id == slice_obj.user_id))
+        student = student_res.scalar_one_or_none()
+        if not student or student.admin_id != user.id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+    if slice_obj.iaas_target == "openstack":
+        topology = slice_obj.topology or {}
+        links = topology.get("links", [])
+        networks = topology.get("networks", [])
+    else:
+        links = slice_obj.topology or []
+        networks = []
+
+    return schemas.SliceCreate(
+        name=slice_obj.name,
+        iaas_target=slice_obj.iaas_target,
+        vms=[
+            schemas.VMSchema(name=vm.name, base_image=vm.base_image, flavor_id=vm.flavor_id, flavor=vm.flavor)
+            for vm in slice_obj.vms
+        ],
+        links=[schemas.LinkSchema(**l) for l in links],
+        networks=[schemas.NetworkSchema(**n) for n in networks],
+    )
+
+# ---------------------------------------------------------------------------
+# POST /slices/{id}/deploy — Despliegue bajo demanda de un slice en Borrador
+# ---------------------------------------------------------------------------
+# Solo SLICE_ADMIN/SYSTEM_ADMIN. Transiciona DRAFT -> ACTIVE ejecutando el
+# mismo flujo de activación que /approve (placement + networking para linux,
+# creación de tareas CREATE_VM + placement para openstack).
+# ---------------------------------------------------------------------------
+@router.post("/{id}/deploy", response_model=schemas.MessageResponse)
+async def deploy_slice(
+    id: int,
+    x_user_role: str = Header(...),
+    x_user_id: int = Header(...),
+    db: AsyncSession = Depends(get_db)
+):
+    user = await get_current_user(x_user_role, x_user_id, db)
+    if user.role not in ["SLICE_ADMIN", "SYSTEM_ADMIN"]:
+        raise HTTPException(status_code=403, detail="Only SLICE_ADMIN/SYSTEM_ADMIN can deploy slices")
+
+    result = await db.execute(
+        select(models.Slice).options(selectinload(models.Slice.vms)).where(models.Slice.id == id)
+    )
+    slice_obj = result.scalar_one_or_none()
+    if not slice_obj:
+        raise HTTPException(status_code=404, detail="Slice not found")
+
+    if user.role == "SLICE_ADMIN" and slice_obj.user_id != user.id:
+        student_res = await db.execute(select(models.User).where(models.User.id == slice_obj.user_id))
+        student = student_res.scalar_one_or_none()
+        if not student or student.admin_id != user.id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+    if slice_obj.status != "DRAFT":
+        raise HTTPException(status_code=409, detail="Slice is not in DRAFT state")
+
+    if slice_obj.iaas_target == "openstack":
+        tasks_created, activation_message = await _activate_openstack_slice(slice_obj, db)
+    else:
+        tasks_created, activation_message = await _activate_linux_slice(slice_obj, db)
+
+    return schemas.MessageResponse(
+        slice_id=slice_obj.id,
+        status="ACTIVE",
+        message=f"Slice desplegado. {activation_message}",
+        tasks_created=tasks_created
+    )
+
+# ---------------------------------------------------------------------------
 # POST /slices/{id}/approve — Aprobar Slice (SLICE_ADMIN)
 # ---------------------------------------------------------------------------
 # Flujo contractual:
@@ -399,281 +777,20 @@ async def approve_slice(
 
     # --- FLUJO OPENSTACK DIRECTO ---
     if slice_obj.iaas_target == "openstack":
-        topology = slice_obj.topology or {}
-        links = topology.get("links", [])
-        networks_in = topology.get("networks", [])
-        
-        networks_payload = []
-        for net in networks_in:
-            networks_payload.append({
-                "name": net.get("name"),
-                "cidr": net.get("cidr"),
-                "is_provider": net.get("is_provider", False)
-            })
-            
-        private_links = []
-        for link in links:
-            vm_a = link.get("vm_a", "")
-            vm_b = link.get("vm_b", "")
-            is_a_provider = vm_a.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
-            is_b_provider = vm_b.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
-            if not is_a_provider and not is_b_provider:
-                private_links.append(link)
-                
-        private_networks = [n for n in networks_payload if not n["is_provider"]]
-        link_net_map = {}
-        for idx, link in enumerate(private_links):
-            if idx < len(private_networks):
-                link_net_map[idx] = private_networks[idx]["name"]
-                
-        vm_vms_payload = []
-        for vm in slice_obj.vms:
-            vm_networks = []
-            for link in links:
-                vm_a = link.get("vm_a", "")
-                vm_b = link.get("vm_b", "")
-                is_a_provider = vm_a.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
-                is_b_provider = vm_b.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"]
-                
-                if vm_a == vm.name:
-                    if is_b_provider:
-                        vm_networks.append(vm_b)
-                    else:
-                        try:
-                            l_idx = private_links.index(link)
-                            net_name = link_net_map.get(l_idx)
-                            if net_name:
-                                vm_networks.append(net_name)
-                        except ValueError:
-                            pass
-                elif vm_b == vm.name:
-                    if is_a_provider:
-                        vm_networks.append(vm_a)
-                    else:
-                        try:
-                            l_idx = private_links.index(link)
-                            net_name = link_net_map.get(l_idx)
-                            if net_name:
-                                vm_networks.append(net_name)
-                        except ValueError:
-                            pass
-                            
-            # Remove duplicates preserving order, and sort so that provider/external networks always come first (map to eth0)
-            unique_networks = list(dict.fromkeys(vm_networks))
-            unique_networks.sort(key=lambda net: 0 if net.upper() in ["INTERNET", "INET", "WAN", "EXTERNAL", "EXTERNAL-PROVIDER"] else 1)
-            
-            vm_vms_payload.append({
-                "name": vm.name,
-                "image": vm.base_image,
-                "flavor": vm.flavor,
-                "networks": unique_networks
-            })
-            
-        task_payload = {
-            "slice_id": slice_obj.name,
-            "vms": vm_vms_payload,
-            "networks": networks_payload
-        }
-        
-        tasks_created = 0
-        for vm in slice_obj.vms:
-            vm.status = "PENDING"
-            task = models.Task(
-                slice_id=slice_obj.id,
-                vm_id=vm.id,
-                task_type="CREATE_VM",
-                status="PLACEMENT_READY",
-                payload=task_payload
-            )
-            db.add(task)
-            tasks_created += 1
-            
-        slice_obj.status = "ACTIVE"
-        await db.commit()
-        
+        tasks_created, activation_message = await _activate_openstack_slice(slice_obj, db)
         return schemas.MessageResponse(
             slice_id=slice_obj.id,
             status="ACTIVE",
-            message=f"Slice de OpenStack aprobado. {tasks_created} tareas de tipo CREATE_VM generadas.",
+            message=f"Slice de OpenStack aprobado. {activation_message}",
             tasks_created=tasks_created
         )
 
-    # --- Paso 1: Crear tareas en PENDING y cambiar VMs a PENDING ---
-    tasks_created = 0
-    for vm in slice_obj.vms:
-        vm.status = "PENDING"
-        task = models.Task(
-            slice_id=slice_obj.id,
-            vm_id=vm.id,
-            task_type="CREATE_VM",
-            status="PENDING",
-            payload={
-                "vm": {
-                    "id": vm.id,
-                    "name": vm.name,
-                    "base_image": vm.base_image,
-                    "ram": vm.ram,
-                    "vcpu": vm.vcpu,
-                    "disk": vm.disk,
-                    "instance_path": ""
-                },
-                "slice": {
-                    "id": slice_obj.id,
-                    "vlan_slice": 0
-                },
-                "interfaces": []
-            }
-        )
-        db.add(task)
-        tasks_created += 1
-
-    # Commit para que VM Placement pueda ver las tareas PENDING
-    await db.commit()
-
-    # --- Paso 2: Invocar VM Placement para asignar workers (Round Robin) ---
-    placement_success = False
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            res = await client.post(f"{PLACEMENT_URL}/placement/trigger")
-            if res.status_code == 200:
-                placement_success = True
-        except httpx.RequestError:
-            pass  # Si Placement no responde, las tareas quedan en PENDING para el loop
-
-    # --- Paso 3: Re-leer VMs con worker_id asignado ---
-    await db.refresh(slice_obj)
-    vm_result = await db.execute(
-        select(models.VirtualMachine).where(models.VirtualMachine.slice_id == slice_obj.id)
-    )
-    vms_updated = vm_result.scalars().all()
-
-    # Construir placement_map: {vm_id: worker_id}
-    placement_map = {}
-    all_placed = True
-    for vm in vms_updated:
-        if vm.worker_id:
-            placement_map[str(vm.id)] = vm.worker_id
-        else:
-            placement_map[str(vm.id)] = 0
-            all_placed = False
-
-    # --- Paso 4: Invocar Networking con placement_map real ---
-    networking_response = None
-    topology_links = slice_obj.topology or []
-
-    if topology_links:
-        # Convertir links de {vm_a: "VM1", ...} a {vm_a_id: 1, ...}
-        vm_name_to_id = {vm.name: vm.id for vm in vms_updated}
-        networking_links = []
-        for i, link in enumerate(topology_links):
-            vm_a_name = str(link.get("vm_a", "")).upper()
-            vm_b_name = str(link.get("vm_b", "")).upper()
-            vm_a_id = 0 if vm_a_name in ("INTERNET", "INET", "WAN", "EXTERNAL") else vm_name_to_id.get(link.get("vm_a"))
-            vm_b_id = 0 if vm_b_name in ("INTERNET", "INET", "WAN", "EXTERNAL") else vm_name_to_id.get(link.get("vm_b"))
-            if vm_a_id is not None and vm_b_id is not None:
-                networking_links.append({
-                    "link_name": f"link_{i}",
-                    "vm_a_id": vm_a_id,
-                    "iface_a": link.get("iface_a", "eth0"),
-                    "vm_b_id": vm_b_id,
-                    "iface_b": link.get("iface_b", "eth0")
-                })
-
-        networking_payload = {
-            "slice_id": slice_obj.id,
-            "placement_map": placement_map,
-            "links": networking_links
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                res = await client.post(f"{NETWORKING_URL}/networking/allocate", json=networking_payload)
-                if res.status_code == 200:
-                    networking_response = res.json()
-            except httpx.RequestError:
-                pass  # Networking se puede invocar después vía Dispatcher
-
-    # --- Paso 5: Enriquecer payloads de las tareas con datos completos ---
-    vlan_slice = None
-    bridge_name = None
-    if networking_response:
-        vlan_slice = networking_response.get("vlan_slice")
-        bridge_name = networking_response.get("bridge_name")
-        slice_obj.vlan_slice = vlan_slice
-
-    # Re-leer tareas + interfaces de cada VM para enriquecer
-    tasks_res = await db.execute(
-        select(models.Task).where(
-            models.Task.slice_id == slice_obj.id,
-            models.Task.task_type == "CREATE_VM"
-        )
-    )
-    tasks = tasks_res.scalars().all()
-
-    for task in tasks:
-        vm = next((v for v in vms_updated if v.id == task.vm_id), None)
-        if not vm:
-            continue
-
-        # Obtener interfaces de la VM desde la BD (insertadas por Networking)
-        ifaces_res = await db.execute(
-            select(models.VmInterface).where(models.VmInterface.vm_id == vm.id)
-        )
-        ifaces = ifaces_res.scalars().all()
-
-        interfaces_payload = []
-        for iface in ifaces:
-            # Obtener datos de la red asociada
-            net_res = await db.execute(
-                select(models.Network).where(models.Network.id == iface.network_id)
-            )
-            net = net_res.scalar_one_or_none()
-            interfaces_payload.append({
-                "interface_name": iface.interface_name,
-                "tap_name": iface.tap_name,
-                "vlan_inner": net.vlan_inner if net else 0,
-                "mac_address": iface.mac_address,
-                "bridge_name": iface.bridge_name or (f"br-sl-{slice_obj.id}" if net else "br-inet"),
-                "network_id": iface.network_id,
-                "is_remote": net.is_remote if net else False
-            })
-
-        instance_path = f"/mnt/storage/instances/{vm.id}.qcow2"
-        vm.instance_path = instance_path
-
-        # Payload completo según payload_schema.md
-        task.payload = {
-            "vm_name": vm.name,
-            "base_image": vm.base_image,
-            "base_path": f"/mnt/storage/base/{vm.base_image}",
-            "instance_path": instance_path,
-            "ram": vm.ram,
-            "vcpu": vm.vcpu,
-            "disk": vm.disk,
-            "slice_id": slice_obj.id,
-            "vlan_slice": vlan_slice,
-            "bridge_name": bridge_name or f"br-sl-{slice_obj.id}",
-            "interfaces": interfaces_payload
-        }
-
-    slice_obj.status = "ACTIVE"
-    await db.commit()
-    
-    status_detail = "ACTIVE"
-    msg_parts = [f"Slice aprobado. {tasks_created} tareas de tipo CREATE_VM generadas."]
-    if placement_success and all_placed:
-        msg_parts.append("Placement completado.")
-    elif not placement_success:
-        msg_parts.append("Placement pendiente (servicio no disponible, las tareas serán procesadas por el loop).")
-    if networking_response:
-        msg_parts.append(f"Networking asignado (Vlan-Slice: {vlan_slice}).")
-    else:
-        msg_parts.append("Networking pendiente (será asignado por el Dispatcher).")
+    tasks_created, activation_message = await _activate_linux_slice(slice_obj, db)
 
     return schemas.MessageResponse(
         slice_id=slice_obj.id,
-        status=status_detail,
-        message=" ".join(msg_parts),
+        status="ACTIVE",
+        message=f"Slice aprobado. {activation_message}",
         tasks_created=tasks_created
     )
 

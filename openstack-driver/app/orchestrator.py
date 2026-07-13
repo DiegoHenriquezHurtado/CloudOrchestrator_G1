@@ -21,8 +21,20 @@ class OpenStackOrchestrator:
             keystone_url=settings.keystone_url,
             neutron_url=settings.neutron_url,
             nova_url=settings.nova_url,
+            glance_url=settings.glance_url,
             compute_api_version=settings.COMPUTE_API_VERSION,
             mock_mode=settings.MOCK_MODE
+        )
+
+    async def _get_admin_token(self) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            self.client.get_admin_token,
+            self.settings.DOMAIN_ID,
+            self.settings.ADMIN_PROJECT_ID,
+            self.settings.ADMIN_USER_ID,
+            self.settings.ADMIN_USER_PASSWORD
         )
 
     async def check_api_connectivity(self) -> bool:
@@ -61,6 +73,18 @@ class OpenStackOrchestrator:
             flavor_id
         )
         return flavor
+
+    async def list_flavors(self) -> list:
+        """Lista los flavors disponibles en Nova (id, nombre, ram, vcpus, disk)"""
+        admin_token = await self._get_admin_token()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.client.list_flavors, admin_token)
+
+    async def list_images(self) -> list:
+        """Lista las imágenes disponibles en Glance (id, nombre, estado)"""
+        admin_token = await self._get_admin_token()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.client.list_images, admin_token)
 
     async def provision_slice(self, req: CreateSliceRequest) -> CreateSliceResponse:
         """
@@ -261,7 +285,9 @@ class OpenStackOrchestrator:
                 vm_detail.status = status
                 
                 if status == "ERROR":
-                    raise Exception(f"La máquina virtual {vm_detail.name} falló al iniciar en OpenStack (estado: ERROR).")
+                    fault = server_info.get("fault", {})
+                    fault_msg = fault.get("message", "sin detalle de Nova")
+                    raise Exception(f"La máquina virtual {vm_detail.name} falló al iniciar en OpenStack (estado: ERROR). Motivo de Nova: {fault_msg}")
                 if status != "ACTIVE":
                     all_active = False
             

@@ -5,13 +5,14 @@ import logging
 logger = logging.getLogger("openstack-driver.client")
 
 class OpenStackClient:
-    def __init__(self, keystone_url: str, neutron_url: str, nova_url: str, compute_api_version: str, mock_mode: bool = False):
+    def __init__(self, keystone_url: str, neutron_url: str, nova_url: str, glance_url: str, compute_api_version: str, mock_mode: bool = False):
         self.keystone_url = keystone_url
         self.neutron_url = neutron_url
         self.nova_url = nova_url
+        self.glance_url = glance_url
         self.compute_api_version = compute_api_version
         self.mock_mode = mock_mode
-        
+
         if mock_mode:
             self._setup_mocks()
 
@@ -36,6 +37,15 @@ class OpenStackClient:
         self.get_server = lambda token, server_id: {"status": "ACTIVE", "id": server_id}
         self.get_vnc_console = lambda token, server_id: f"http://10.20.11.231:6080/vnc_lite.html?path=%3Ftoken%3D{server_id}"
         self.get_flavor = lambda token, flavor_id: {"id": flavor_id, "ram": 2048, "vcpus": 2, "disk": 20}
+        self.list_flavors = lambda token: [
+            {"id": "1", "name": "m1.tiny", "ram": 512, "vcpus": 1, "disk": 1},
+            {"id": "2", "name": "m1.small", "ram": 2048, "vcpus": 1, "disk": 20},
+            {"id": "3", "name": "m1.medium", "ram": 4096, "vcpus": 2, "disk": 40},
+        ]
+        self.list_images = lambda token: [
+            {"id": "img-cirros-uuid", "name": "cirros-0.6.2", "status": "active", "size": 16300000},
+            {"id": "img-ubuntu-uuid", "name": "ubuntu-22.04", "status": "active", "size": 700000000},
+        ]
 
     def _check(self, response: requests.Response, expected_status: int, op_name: str):
         if response.status_code != expected_status:
@@ -336,3 +346,19 @@ class OpenStackClient:
         res = requests.get(url, headers=headers, timeout=15)
         self._check(res, 200, "get_flavor")
         return res.json().get("flavor", {})
+
+    def list_flavors(self, token: str) -> list:
+        url = f"{self.nova_url}/flavors/detail"
+        headers = {"X-Auth-Token": token}
+        res = requests.get(url, headers=headers, timeout=15)
+        self._check(res, 200, "list_flavors")
+        return res.json().get("flavors", [])
+
+    # --- GLANCE ---
+
+    def list_images(self, token: str) -> list:
+        url = f"{self.glance_url}/images"
+        headers = {"X-Auth-Token": token}
+        res = requests.get(url, headers=headers, timeout=15)
+        self._check(res, 200, "list_images")
+        return res.json().get("images", [])

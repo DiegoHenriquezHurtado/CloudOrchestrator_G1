@@ -166,5 +166,15 @@ services:
       - OS_PROVIDER_NETWORK_NAME=external
       - MOCK_MODE=false
 
+  frontend:
+    image: nginx:alpine
+    container_name: orchestrator-frontend
+    ports:
+      - "80:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on:
+      - api-gateway
+      
 volumes:
   pgdata:

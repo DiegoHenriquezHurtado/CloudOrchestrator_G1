@@ -129,6 +129,34 @@ async def health():
         "openstack_api_reachable": openstack_connected
     }
 
+@app.get("/v1/flavors", summary="Listar flavors disponibles en Nova")
+async def list_flavors():
+    """Retorna el catálogo de flavors de Nova (id, name, ram, vcpus, disk) para poblar selects en el frontend"""
+    try:
+        flavors = await orchestrator.list_flavors()
+        return {"flavors": flavors}
+    except Exception as e:
+        logger.error(f"Error listando flavors: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Error al listar flavors en OpenStack", "error": str(e)}
+        )
+
+
+@app.get("/v1/images", summary="Listar imágenes disponibles en Glance")
+async def list_images():
+    """Retorna el catálogo de imágenes de Glance (id, name, status) para poblar selects en el frontend"""
+    try:
+        images = await orchestrator.list_images()
+        return {"images": images}
+    except Exception as e:
+        logger.error(f"Error listando imágenes: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Error al listar imágenes en OpenStack", "error": str(e)}
+        )
+
+
 @app.get("/v1/flavors/{flavor_id}", summary="Obtener detalles de un flavor")
 async def get_flavor(flavor_id: str):
     """Retorna los detalles de un flavor desde Nova (ram, vcpus, disk)"""
