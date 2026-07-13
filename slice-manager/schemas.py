@@ -85,10 +85,15 @@ class VMDetail(BaseModel):
     id: int
     name: str
     worker_id: Optional[int]
+    worker_name: Optional[str] = None
     status: str
     process_id: Optional[int]
     vnc_port: Optional[int]
     vnc_url: Optional[str] = None
+    base_image: Optional[str] = None
+    ram: Optional[int] = None
+    vcpu: Optional[int] = None
+    disk: Optional[int] = None
     interfaces: List[VmInterfaceDetail]
 
     class Config:
@@ -100,6 +105,7 @@ class SliceDetailResponse(BaseModel):
     status: str
     vlan_slice: Optional[int]
     vms: List[VMDetail]
+    links: List[LinkSchema] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

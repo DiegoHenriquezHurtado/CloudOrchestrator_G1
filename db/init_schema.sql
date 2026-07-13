@@ -122,9 +122,9 @@ INSERT INTO vlan_pool (vlan_id) SELECT generate_series(100, 1000);
 -- y actualizará periódicamente current_cpu_load, current_ram_available y status.
 INSERT INTO workers (hostname, ip_management, total_ram, total_cpu, current_ram_available, cluster_type)
 VALUES
-    ('server1', '10.0.10.1', 0, 0, 0, 'linux'),
-    ('server2', '10.0.10.2', 0, 0, 0, 'linux'),
-    ('server3', '10.0.10.3', 0, 0, 0, 'linux'),
+    ('server1', '192.168.201.1', 8192, 8, 8192, 'linux'),
+    ('server2', '192.168.201.2', 8192, 8, 8192, 'linux'),
+    ('server3', '192.168.201.3', 8192, 8, 8192, 'linux'),
     ('worker1', '192.168.202.2', 8192, 8, 8192, 'openstack'),
     ('worker2', '192.168.202.3', 8192, 8, 8192, 'openstack'),
     ('worker3', '192.168.202.4', 8192, 8, 8192, 'openstack');

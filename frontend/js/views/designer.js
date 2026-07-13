@@ -257,6 +257,23 @@ function tdInitCanvas(editData) {
   tdUpdateSummary();
 }
 
+// ── Preview de topología de solo lectura (usada por slices.js al ver un slice) ──
+// Dibuja una sola vez, sin listeners ni loop de animación; no toca el TD del diseñador.
+function tdRenderStatic(canvasId, data) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const r = canvas.parentElement.getBoundingClientRect();
+  canvas.width = r.width;
+  canvas.height = r.height;
+  const ctx = canvas.getContext('2d');
+
+  const prevTD = TD;
+  TD = { vms: [], links: [], nextVmId: 1, nextLinkId: 1, selected: null, mode: 'view', connectFrom: null, mouseX: 0, mouseY: 0 };
+  tdLoadFromExport(data, canvas.width, canvas.height);
+  tdRender(ctx, canvas.width, canvas.height);
+  TD = prevTD;
+}
+
 // ── Carga una topología existente (desde GET /slices/{id}/export) en el canvas ──
 const TD_INTERNET_ALIASES = ['internet', 'inet', 'wan', 'external', 'external-provider'];
 function tdIsInternetName(name) { return TD_INTERNET_ALIASES.includes(String(name || '').toLowerCase()); }

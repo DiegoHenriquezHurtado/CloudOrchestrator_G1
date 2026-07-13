@@ -597,8 +597,28 @@ async def get_slice(
         if not student or student.admin_id != user.id:
             raise HTTPException(status_code=403, detail="Not authorized")
 
+    worker_ids = {vm.worker_id for vm in slice_obj.vms if vm.worker_id is not None}
+    worker_names = {}
+    if worker_ids:
+        workers_res = await db.execute(
+            text("SELECT id, hostname FROM workers WHERE id = ANY(:ids)"),
+            {"ids": list(worker_ids)}
+        )
+        worker_names = {row.id: row.hostname for row in workers_res}
+
+    OPENSTACK_DRIVER_URL = os.getenv("OPENSTACK_DRIVER_URL", "http://openstack-driver:8089")
+    image_names = {}
+
     vms = []
     async with httpx.AsyncClient(timeout=5.0) as client:
+        if slice_obj.iaas_target == "openstack":
+            try:
+                res = await client.get(f"{OPENSTACK_DRIVER_URL}/v1/images")
+                if res.status_code == 200:
+                    image_names = {img["id"]: img["name"] for img in res.json().get("images", [])}
+            except Exception:
+                pass
+
         for vm in slice_obj.vms:
             interfaces = []
             for iface in vm.interfaces:
@@ -614,7 +634,6 @@ async def get_slice(
             vnc_url = vm.vnc_url
             if slice_obj.iaas_target == "openstack" and vm.instance_path:
                 try:
-                    OPENSTACK_DRIVER_URL = os.getenv("OPENSTACK_DRIVER_URL", "http://openstack-driver:8089")
                     res = await client.get(f"{OPENSTACK_DRIVER_URL}/v1/vms/{vm.instance_path}/vnc")
                     if res.status_code == 200:
                         vnc_url = res.json().get("vnc_url", vm.vnc_url)
@@ -625,19 +644,30 @@ async def get_slice(
                 id=vm.id,
                 name=vm.name,
                 worker_id=vm.worker_id,
+                worker_name=worker_names.get(vm.worker_id),
                 status=vm.status,
                 process_id=vm.process_id,
                 vnc_port=vm.vnc_port,
                 vnc_url=vnc_url,
+                base_image=image_names.get(vm.base_image, vm.base_image),
+                ram=vm.ram,
+                vcpu=vm.vcpu,
+                disk=vm.disk,
                 interfaces=interfaces
             ))
+
+    if slice_obj.iaas_target == "openstack":
+        links = (slice_obj.topology or {}).get("links", [])
+    else:
+        links = slice_obj.topology or []
 
     return schemas.SliceDetailResponse(
         id=slice_obj.id,
         name=slice_obj.name,
         status=slice_obj.status,
         vlan_slice=slice_obj.vlan_slice,
-        vms=vms
+        vms=vms,
+        links=links
     )
 
 # ---------------------------------------------------------------------------
